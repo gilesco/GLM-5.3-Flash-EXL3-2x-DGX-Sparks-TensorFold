@@ -1,21 +1,16 @@
-# TF_GLM_STREAM_SMOOTH=1 (STREAM_SMOOTH): a streamed reply's tokens go out one event each at a steady pace from a
-# short playout buffer (TF_GLM_STREAM_SMOOTH_MS, default 400), so drafted bursts and pauses shorter than the buffer
-# (another request's prompt slices) do not show; same text and end, tool calls in place, the last round flushes.
-# MiaAI-Lab, Apache-2.0.
-
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index fb24558..21f81ef 100644
+index 897dc75..7734db1 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -26,6 +26,7 @@ from tensorfold.cuda import health
+@@ -28,6 +28,7 @@ from tensorfold.cuda import health
  from tensorfold.cuda.chat_template import ChatTemplate
  from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
                                          close_glm_call, hide_tool_calls, parse_tool_calls)
 +from tensorfold.cuda.stream_pacing import Playout, smooth_streaming
  from tensorfold.cuda.turns import Turns, Yield
  from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
- 
-@@ -409,8 +410,36 @@ class App:
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+@@ -463,8 +464,36 @@ class App:
  
          serving: list[Any] = [None]
  
@@ -52,7 +47,7 @@ index fb24558..21f81ef 100644
              if stopped["client"] or stopped["stop"] or failed:
                  return True
              try:
-@@ -425,28 +454,34 @@ class App:
+@@ -479,28 +508,34 @@ class App:
                      new = kept
                  else:
                      out.extend(new)
@@ -101,7 +96,7 @@ index fb24558..21f81ef 100644
                              stopped["client"] = True
                              break
                  if not stopped["client"] and cancelled is not None and cancelled():   # every round, text or not
-@@ -520,8 +555,18 @@ class App:
+@@ -574,8 +609,18 @@ class App:
                  serving[0] = request
                  try:
                      stats = request.stats = generate_gated(generate, prompt, max_tokens, gates, on_tokens)
@@ -120,6 +115,133 @@ index fb24558..21f81ef 100644
          finally:
              if turns is not None:
                  turns.give()
+diff --git tensorfold/cuda/server.py.orig tensorfold/cuda/server.py.orig
+index fef64e8..897dc75 100644
+--- tensorfold/cuda/server.py.orig
++++ tensorfold/cuda/server.py.orig
+@@ -27,11 +27,15 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+-                                        hide_tool_calls, parse_tool_calls)
++                                        close_glm_call, hide_tool_calls, parse_tool_calls)
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+ 
++# While a GLM tool call is written it is held until whole (a call the reply ends inside is never sent); an idle client
++# (upstream #114: one that drops a reply sending nothing) gets an empty delta this often meanwhile
++CALL_KEEPALIVE_S = 2.0
++
+ 
+ # -- requests --------------------------------------------------------------------------------
+ 
+@@ -258,7 +262,7 @@ class App:
+         if chat:
+             if not isinstance(body.get("messages"), list):
+                 raise RequestError("messages must be a list")
+-            from tensorfold.server.prompts import has_images, prepare_images
++            from tensorfold.server.prompts import has_images, prepare_images, tool_media_parts
+ 
+             def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
+                 try:
+@@ -267,7 +271,12 @@ class App:
+                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
+                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
+ 
+-            if has_images(body["messages"]):
++            # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM)
++            reminded = (tool_media_parts(body["messages"]) if getattr(self, "tool_media_reminders", False)
++                        and getattr(self, "vision", None) is None else None)
++            if reminded is not None:
++                text = render(reminded, allow_images=True)
++            elif has_images(body["messages"]):
+                 rendered = prepare_images(self.vision, body["messages"],
+                                           lambda messages: render(messages, allow_images=True),
+                                           context_limit=self._context_limit(),
+@@ -275,7 +284,8 @@ class App:
+                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+-            text = render(body["messages"])
++            else:
++                text = render(body["messages"])
+             prompt = self.tok.encode(text, add_special_tokens=False).ids
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+@@ -417,10 +427,12 @@ class App:
+         # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
+         glm_calls = bool(tools) and self._glm_calls()
+         calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
++        quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
+         # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
+         # end parser
+         xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
+         answer_raw = [""]
++        closing = [""]                       # what closes a GLM call the reply ended inside on an end token (#22)
+         # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
+         think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
+                  else None)
+@@ -441,6 +453,7 @@ class App:
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
++            raw = raw + closing[0] if finished else raw
+             reasoning, answer = split(raw, finished)
+             answer_raw[0] = answer
+             if tools:
+@@ -478,6 +491,11 @@ class App:
+                 parts = [delta] if delta else []
+                 if calls_stream is not None:
+                     parts += calls_stream.feed(call_text(raw))
++                    if parts:
++                        quiet_since[0] = time.monotonic()
++                    elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
++                        parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
++                        quiet_since[0] = time.monotonic()
+                 if not all(emit(part) for part in parts):
+                     stopped["client"] = True
+                 if xml_stream is not None and not stopped["client"]:
+@@ -566,12 +584,18 @@ class App:
+         if stopped["client"]:                                        # as the Mac server: nothing more is written
+             raise RequestCancelled("the client left during the reply")
+         stats = {**(stats or {}), "token_sha": token_sha(out)}
++        # the model's end token (not a stop string or the token limit) ended the reply: a call it ended inside is
++        # closed when it then parses (#22), else its markup is the reply's text; it is never dropped
++        ended = bool(out) and out[-1] in ends and not stopped["stop"]
++        if ended and glm_calls:
++            final_raw = stream.final()
++            closing[0] = close_glm_call(stops.visible(final_raw) if stops.strings else final_raw, tools)
+         reasoning, answer, raw = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+-        text = stops.visible(raw_text)
++        text = stops.visible(raw_text) + closing[0]
+         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+@@ -580,11 +604,15 @@ class App:
+         # (never streamed) are the end parser's, sent whole
+         if calls_stream is not None and (think is None or think.stream_from is not None):
+             call_deltas = calls_stream.feed(call_text(raw))
+-            streamed = len(calls_stream.calls)
+-            calls = [*calls_stream.calls, *calls_stream.rest(tools)] or None
+-        cut = calls_stream is not None and calls_stream.open        # a streamed call the reply ended inside
+-        if cut:                                 # its text went out as a call already, not again as content
++            streamed = calls_stream.sent
++            calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
++        # a call the token limit cut (the reply ended inside it): never sent, nor its markup as content; one the
++        # model's end token left open that would not parse, its markup as text (``closing`` closed the others)
++        cut = calls_stream is not None and calls_stream.open and not ended
++        if cut:
+             content = answer.strip()
++        elif tools and not ended and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
++            content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut text
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:
+             final["content"] = tail
 diff --git tensorfold/cuda/stream_pacing.py tensorfold/cuda/stream_pacing.py
 new file mode 100644
 index 0000000..9c6b61c

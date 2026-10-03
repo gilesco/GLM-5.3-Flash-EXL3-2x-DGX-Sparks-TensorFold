@@ -1,41 +1,322 @@
 diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
-index 84ae839..dabd045 100644
+index 124eab1..ec16d4f 100644
 --- tensorfold/cuda/http.py
 +++ tensorfold/cuda/http.py
-@@ -110,11 +110,12 @@ def make_handler(app: App):
-                     _log_error(exc)
-                     return self._json(400, {"error": {"message": _error_message(exc)}})
+@@ -136,6 +136,7 @@ def make_handler(app: App):
                  return self._json(200, reply)
-+            field = "messages" if chat else "prompt"            # the field an error's code names (OpenAI's param)
+             field = "messages" if chat else "prompt"            # the field an error's code names (OpenAI's param)
+ 
++
              try:
                  prepared = app.prepare(body, chat)
              except RequestError as exc:
-                 return self._json(503 if isinstance(exc, CapacityError) else 400,
--                                  {"error": error_body(exc)})
+diff --git tensorfold/cuda/http.py.orig tensorfold/cuda/http.py.orig
+new file mode 100644
+index 0000000..ec16d4f
+--- /dev/null
++++ tensorfold/cuda/http.py.orig
+@@ -0,0 +1,299 @@
++"""The CUDA server's HTTP side: OpenAI routes over ``App`` (tensorfold.cuda.server), streamed or not."""
++from __future__ import annotations
++
++import json
++import time
++import traceback
++import uuid
++from typing import TYPE_CHECKING, Any
++
++from tensorfold.cuda import health
++from tensorfold.server import anthropic, metrics, responses, token_routes
++from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
++from tensorfold.server.decisions import DecisionError
++from tensorfold.server.errors import CapacityError, RequestError, error_body
++from tensorfold.server.http import Server, wants_usage_chunk
++from tensorfold.server.request_body import read_body
++from tensorfold.server.stacks import Rearming
++
++if TYPE_CHECKING:
++    from tensorfold.cuda.server import App
++
++
++_TOKENIZER_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
++
++
++def usage_of(result: dict[str, Any]) -> dict[str, Any]:
++    """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
++
++    return {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
++            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
++            "prompt_tokens_details": {"cached_tokens": result.get("cached_tokens", 0)},
++            "completion_tokens_details": {"reasoning_tokens": result.get("reasoning_tokens", 0)}}
++
++
++def _error_message(exc: BaseException) -> str:
++    return str(exc) or type(exc).__name__
++
++
++def _log_error(exc: BaseException) -> None:
++    print(f"[tensorfold] request error: {type(exc).__name__}: {exc}", flush=True)
++    traceback.print_exception(exc)
++
++
++POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health")
++
++
++def make_handler(app: App):
++    class Handler(Rearming):              # USR1's stack dump armed again after each request
++        protocol_version = "HTTP/1.1"
++
++        def log_message(self, fmt, *args):    # one line a request, as the Mac server prints
++            print(f"[tensorfold] {self.address_string()} {fmt % args}", flush=True)
++
++        def log_request(self, code="-", size="-"):
++            # a scraper polls these every few seconds and would bury the requests; a failed poll still prints
++            if not (self.command == "GET" and self.path.split("?", 1)[0].rstrip("/") in POLLED and code == 200):
++                super().log_request(code, size)
++
++        def _json(self, code: int, payload: dict[str, Any]) -> None:
++            data = json.dumps(payload).encode()
++            try:
++                self.send_response(code)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(data)))
++                if self.close_connection:                # so a pooling client does not reuse the socket
++                    self.send_header("Connection", "close")
++                self.end_headers()
++                self.wfile.write(data)
++            except (BrokenPipeError, ConnectionResetError):          # the client has gone
++                self.close_connection = True
++
++        def _discard_body(self) -> None:
++            """Read a refused request's body, so it cannot reach the next request on this connection."""
++
++            try:
++                read_body(self)
++            except RequestError:
++                pass  # the reader closes the connection when framing cannot be drained
++
++        def _stream_error(self, error: dict[str, Any]) -> None:
++            """End an open stream with an error event and ``[DONE]``, as the MLX server does."""
++
++            try:
++                self.wfile.write(f"data: {json.dumps({'error': error})}\n\ndata: [DONE]\n\n".encode())
++                self.wfile.flush()
++            except OSError:
++                pass
++            self.close_connection = True
++
++        def do_GET(self):
++            route = self.path.split("?", 1)[0].rstrip("/")
++            if route in ("/metrics", "/v1/metrics"):
++                return metrics.send(self, app)
++            if self.path.rstrip("/") in ("/v1/models", "/models"):
++                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
++                                                            for model_id in app.model_ids]})
++            elif self.path.rstrip("/") in ("/health", "/v1/health"):
++                self._json(200, health.of(app).snapshot(app))
++            elif responses.route(self.path):
++                responses.get(self, app, responses.route(self.path))
++            else:
++                self._json(404, {"error": "not found"})
++
++        def do_DELETE(self):
++            responses.delete(self, app, responses.route(self.path))
++
++        def do_POST(self):
++            path = self.path.split("?", 1)[0].rstrip("/")
++            if path.endswith("/decisions"):
++                return self._post_decisions()
++            if anthropic.route(self.path):
++                return anthropic.post(self, app)
++            if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
++                return responses.post(self, app)
++            chat = self.path.rstrip("/").endswith("/chat/completions")
++            tokenizer = path in token_routes.ROUTES
++            if not chat and not tokenizer and not self.path.rstrip("/").endswith("/completions"):
++                self._discard_body()
++
++                return self._json(404, {"error": "not found"})
++            try:
++                body = json.loads(read_body(self) or b"{}")
++            except RequestError as exc:
++                return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
++            except (json.JSONDecodeError, UnicodeDecodeError):
++                return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
++            if tokenizer:                                   # vLLM's /tokenize and /detokenize
++                try:
++                    reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)
++                except RequestError as exc:
++                    return self._json(503 if isinstance(exc, CapacityError) else 400, {"error": error_body(exc)})
++
++                except Exception as exc:
++                    _log_error(exc)
++                    return self._json(400, {"error": {"message": _error_message(exc)}})
++                return self._json(200, reply)
++            field = "messages" if chat else "prompt"            # the field an error's code names (OpenAI's param)
++
++
++            try:
++                prepared = app.prepare(body, chat)
++            except RequestError as exc:
++                return self._json(503 if isinstance(exc, CapacityError) else 400,
 +                                  {"error": error_body(exc, field)})
-             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
-                 _log_error(exc)
-                 return self._json(400, {"error": {"message": _error_message(exc)}})
-@@ -156,7 +157,7 @@ def make_handler(app: App):
-                     self.close_connection = True
-                     return
-                 except RequestError as exc:
--                    return self._stream_error(error_body(exc))
++            except Exception as exc:        # any other failure to read the request is refused too, as on MLX
++                _log_error(exc)
++                return self._json(400, {"error": {"message": _error_message(exc)}})
++            rid = f"chatcmpl-{uuid.uuid4().hex[:24]}" if chat else f"cmpl-{uuid.uuid4().hex[:24]}"
++            created = int(time.time())
++            model = app.reply_model(body)
++            stream = bool(body.get("stream"))
++            separate_usage = wants_usage_chunk(body)          # usage then rides its own chunk before [DONE]
++            kind = "chat.completion.chunk" if chat else "text_completion"
++            gone = socket_cancellation(self.connection)          # the Mac server's check: the client has closed
++            cancelled = lambda: gone.cancelled                  # noqa: E731
++
++            def chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
++                if chat:
++                    return {"id": rid, "object": kind, "created": created, "model": model,
++                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
++                return {"id": rid, "object": kind, "created": created, "model": model,
++                        "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
++
++            if stream:
++                self.send_response(200)
++                self.send_header("Content-Type", "text/event-stream")
++                self.send_header("Cache-Control", "no-cache")
++                self.send_header("Connection", "close")
++                self.end_headers()
++
++                def emit(delta: dict[str, Any]) -> bool:
++                    try:
++                        self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
++                        self.wfile.flush()
++                        return True
++                    except OSError:             # reset, broken pipe, timed out, host unreachable: the client has gone
++                        return False
++
++                if chat:
++                    emit({"role": "assistant"})
++                try:
++                    result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++                except RequestCancelled:
++                    self.close_connection = True
++                    return
++                except RequestError as exc:
 +                    return self._stream_error(error_body(exc, field))
-                 except Exception as exc:
-                     _log_error(exc)
-                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
-@@ -188,7 +189,7 @@ def make_handler(app: App):
-                 return
-             except RequestError as exc:
-                 return self._json(503 if isinstance(exc, CapacityError) else 400,
--                                  {"error": error_body(exc)})
++                except Exception as exc:
++                    _log_error(exc)
++                    return self._stream_error({"message": _error_message(exc), "type": "server_error"})
++                if result["final"]:
++                    emit(result["final"])
++                for delta in result.get("call_deltas") or ():      # the end of calls streamed as they were written
++                    emit(delta)
++                if result["calls"]:
++                    for i, call in enumerate(result["calls"]):
++                        if i < result.get("calls_streamed", 0):      # sent as deltas already
++                            continue
++                        emit({"tool_calls": [{"index": i, "id": call["id"], "type": "function",
++                                              "function": {"name": call["function"]["name"],
++                                                           "arguments": call["function"]["arguments"]}}]})
++                end = chunk({}, result["finish"])
++                if result.get("stop_sequence") is not None:
++                    end["stop_sequence"] = result["stop_sequence"]
++                end["tensorfold"] = result["stats"]
++                frames = [end]
++                if separate_usage:                              # the spec: usage rides its own chunk before [DONE]
++                    frames.append({"id": rid, "object": kind, "created": created, "model": model,
++                                   "choices": [], "usage": usage_of(result)})
++                else:
++                    end["usage"] = usage_of(result)      # every stream, as the Mac server's: clients count from it
++                try:
++                    self.wfile.write("".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode()
++                                     + b"data: [DONE]\n\n")
++                    self.wfile.flush()
++                except (BrokenPipeError, ConnectionResetError):
++                    pass
++                self.close_connection = True
++                return
++            try:
++                result = app.run(body, chat, lambda delta: True, prepared=prepared, cancelled=cancelled)
++            except RequestCancelled:
++                self.close_connection = True
++                return
++            except RequestError as exc:
++                return self._json(503 if isinstance(exc, CapacityError) else 400,
 +                                  {"error": error_body(exc, field)})
-             except Exception as exc:
-                 _log_error(exc)
-                 try:
++            except Exception as exc:
++                _log_error(exc)
++                try:
++                    self._json(500, {"error": {"message": _error_message(exc)}})
++                except OSError:
++                    pass
++                return
++            usage = usage_of(result)
++            if chat:
++                message: dict[str, Any] = {"role": "assistant", "content": result["content"] or None}
++                if result["reasoning"]:
++                    message["reasoning_content"] = result["reasoning"]
++                if result["calls"]:
++                    message["tool_calls"] = result["calls"]
++                payload = {"id": rid, "object": "chat.completion", "created": created, "model": model,
++                           "choices": [{"index": 0, "message": message, "finish_reason": result["finish"]}],
++                           "usage": usage, "tensorfold": result["stats"]}
++                if result.get("logprobs") is not None:
++                    payload["choices"][0]["logprobs"] = result["logprobs"]
++            else:
++                payload = {"id": rid, "object": "text_completion", "created": created, "model": model,
++                           "choices": [{"index": 0, "text": result["content"], "finish_reason": result["finish"]}],
++                           "usage": usage, "tensorfold": result["stats"]}
++            if result.get("stop_sequence") is not None:
++                payload["stop_sequence"] = result["stop_sequence"]
++            self._json(200, payload)
++
++        def _post_decisions(self) -> None:
++            decide = getattr(app, "decisions", None)
++            if decide is None:
++                self._discard_body()
++                return self._json(404, {"error": {"message": f"unknown path {self.path}",
++                                                  "type": "invalid_request_error"}})
++            try:
++                body = json.loads(read_body(self) or b"{}")
++                if not isinstance(body, dict):
++                    raise RequestError("request body must be an object")
++            except RequestError as exc:
++                return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
++            except Exception as exc:        # noqa: BLE001 - a bad body is a client error
++                return self._json(400, {"error": {"message": _error_message(exc), "type": "invalid_request_error"}})
++            try:
++                payload = decide(body)
++            except (RequestError, DecisionError) as exc:
++                return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
++            except Exception as exc:        # a scoring failure is the server's, not a bad body
++                _log_error(exc)
++                try:
++                    return self._json(500, {"error": {"message": _error_message(exc)}})
++                except OSError:
++                    return
++            self._json(200, payload)
++
++    return Handler
++
++
++def serve(app: App, host: str, port: int) -> None:
++    """Serve until interrupted (SIGTERM included)."""
++
++    import signal
++
++    def _terminate(signum: int, frame: Any) -> None:
++        raise KeyboardInterrupt
++
++    signal.signal(signal.SIGTERM, _terminate)
++    server = Server((host, port), make_handler(app))
++    try:
++        server.serve_forever()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
 diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
-index c776de5..8a96996 100644
+index c60b76f..0b2d762 100644
 --- tensorfold/families/glm5_next/cuda/app.py
 +++ tensorfold/families/glm5_next/cuda/app.py
 @@ -6,6 +6,7 @@ from pathlib import Path
@@ -44,58 +325,84 @@ index c776de5..8a96996 100644
  from tensorfold.cuda.server import App, PreparedRequest, RequestError
 +from tensorfold.server.errors import CONTEXT_LIMIT
  from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
- from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
- 
-@@ -75,8 +76,10 @@ class GlmApp(App):
-         if need <= limit:
+ from tensorfold.families.glm5_next.prompts import agent_history, clear_thinking, thinking_off
+ from tensorfold.server.errors import CONTEXT_LIMIT
+@@ -79,6 +80,7 @@ class GlmApp(App):
              return super().check(body, prepared=prepared)
          detail = f"{prompt} prompt tokens plus max_tokens {int(asked)}" if asked else f"a {prompt}-token prompt"
--        return (f"this request needs a {need}-token context ({detail}), and this server was started for {limit}: "
--                f"shorten the prompt or reply{self._restart(need, ' both ranks')}")
-+        # v0.6.0 (68c6e35, Apache-2.0): OpenAI's wording, so prepare refuses it as context_length_exceeded
-+        return (f"{CONTEXT_LIMIT} {limit} tokens: this request needs a {need}-token context ({detail}), which exceeds "
-+                f"the context window this server was started for; shorten the prompt or reply"
-+                f"{self._restart(need, ' both ranks')}")
- 
-     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
-             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
+         # OpenAI's wording, so prepare refuses it as context_length_exceeded (clients compact on it)
++
+         return (f"{CONTEXT_LIMIT} {limit} tokens: this request needs a {need}-token context ({detail}), which exceeds "
+                 f"the context window this server was started for; shorten the prompt or reply"
+                 f"{self._restart(need, ' both ranks')}")
 diff --git tensorfold/server/errors.py tensorfold/server/errors.py
-index e523c5a..b4a47dd 100644
+index 74f40b2..a99224a 100644
 --- tensorfold/server/errors.py
 +++ tensorfold/server/errors.py
-@@ -29,10 +29,11 @@ def refusal(problem: str) -> RequestError:
-     return (ContextLengthError if problem.startswith(CONTEXT_LIMIT) else RequestError)(problem)
+@@ -33,6 +33,7 @@ def error_body(exc: Exception, param: str | None = None) -> dict:
+     """OpenAI's error object: the message, its type, and where there is a code clients key on, the field and code
+     (``param``: ``messages`` for a chat completion, ``prompt`` for a completion, as OpenAI names them)."""
  
- 
--def error_body(exc: Exception) -> dict:
--    """OpenAI's error object: the message, its type, and the code clients key on where there is one."""
-+def error_body(exc: Exception, param: str | None = None) -> dict:
-+    """OpenAI's error object: the message, its type, and where there is a code clients key on, the field and code."""
- 
++
      body = {"message": str(exc), "type": "invalid_request_error"}
      if getattr(exc, "code", None):
+         body["param"] = param
+diff --git tensorfold/server/errors.py.orig tensorfold/server/errors.py.orig
+new file mode 100644
+index 0000000..a99224a
+--- /dev/null
++++ tensorfold/server/errors.py.orig
+@@ -0,0 +1,41 @@
++class RequestError(ValueError):
++    """A request refusal: HTTP 400, or a named error after a stream starts."""
++
++
++class CapacityError(RequestError):
++    """A transient capacity refusal: HTTP 503, retry shortly."""
++
++
++class RoundError(RuntimeError):
++    """A failed round's type and message, without its engine frames or exception payloads."""
++
++    def __init__(self, error_type: str, message: str) -> None:
++        super().__init__(message)
++        self.error_type = error_type
++
++
++class ContextLengthError(RequestError):
++    """A prompt and its reply past the context window: OpenAI's context_length_exceeded, which clients compact on."""
++
++    code = "context_length_exceeded"
++
++
++CONTEXT_LIMIT = "This server's maximum context length is"      # OpenAI's wording, which clients match to compact
++
++
++def refusal(problem: str) -> RequestError:
++    """A refusal string as its error: a context-window one carries OpenAI's code."""
++
++    return (ContextLengthError if problem.startswith(CONTEXT_LIMIT) else RequestError)(problem)
++
++
++def error_body(exc: Exception, param: str | None = None) -> dict:
++    """OpenAI's error object: the message, its type, and where there is a code clients key on, the field and code
++    (``param``: ``messages`` for a chat completion, ``prompt`` for a completion, as OpenAI names them)."""
++
++
++    body = {"message": str(exc), "type": "invalid_request_error"}
++    if getattr(exc, "code", None):
 +        body["param"] = param
-         body["code"] = exc.code
-     return body
++        body["code"] = exc.code
++    return body
 diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
-index ee19680..2b9c05b 100644
+index 8d171e9..1e5ea7c 100644
 --- tensorfold/server/prompts.py
 +++ tensorfold/server/prompts.py
-@@ -5,7 +5,7 @@ from dataclasses import dataclass
- import threading
- from typing import Any
- 
--from tensorfold.server.errors import CapacityError, RequestError
-+from tensorfold.server.errors import CapacityError, RequestError, refusal
- from tensorfold.server.messages import _normalize_tool_call_arguments, normalize_messages
- 
- 
-@@ -67,7 +67,7 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
-         else:
-             prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+@@ -67,6 +67,7 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
+         prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
      except (ImageInputError, ValueError, ImportError) as exc:
--        raise RequestError(str(exc)) from exc
-+        raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
+         raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded
++
      finally:
          slot.release()
      return RenderedPrompt(list(prepared.token_ids), vision=prepared)

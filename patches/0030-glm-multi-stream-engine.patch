@@ -1,8 +1,8 @@
 diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
-index d926642..b08e325 100644
+index b4e417e..62299f0 100644
 --- tensorfold/cuda/health.py
 +++ tensorfold/cuda/health.py
-@@ -83,6 +83,14 @@ class Health:
+@@ -89,6 +89,14 @@ class Health:
          if decoder is not None:                         # read, never locked: sizes of the decoder's own tables
              body["streams"] = {"decoding": len(getattr(decoder, "streams", ())),
                                 "prefilling": len(getattr(decoder, "filling", ())), "max": scheduler.max_streams}
@@ -17,8 +17,128 @@ index d926642..b08e325 100644
          window = getattr(app, "effective_context_window", None)
          if window:
              body["context_length"] = int(window)
+diff --git tensorfold/cuda/health.py.orig tensorfold/cuda/health.py.orig
+new file mode 100644
+index 0000000..b4e417e
+--- /dev/null
++++ tensorfold/cuda/health.py.orig
+@@ -0,0 +1,114 @@
++"""The CUDA server's /health counters: finished requests' own engine stats, plus live replies read off the rounds."""
++
++from __future__ import annotations
++
++import threading
++import time
++from contextlib import contextmanager
++from typing import Any
++
++from tensorfold.server import metrics
++
++STATS = {"prefill_s": "prefill_seconds_total", "decode_s": "decode_seconds_total", "cached": "cached_tokens_total",
++         "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total"}
++_MADE = threading.Lock()
++
++
++class Request:
++    """One running request: its prompt length and the server's own list of its reply tokens (only ever read here)."""
++
++    def __init__(self, prompt: int, out: list[int], arrived: float | None = None) -> None:
++        self.prompt, self.out, self.stats = prompt, out, None
++        self.started = time.perf_counter() if arrived is None else float(arrived)
++        self.first: float | None = None
++
++    def saw(self) -> None:
++        """The first generated token has landed in ``out``."""
++
++        if self.first is None and self.out:
++            self.first = time.perf_counter()
++
++
++class Health:
++    """Totals of finished requests and the requests running now; the engine's rounds never call in here."""
++
++    def __init__(self) -> None:
++        self.lock = threading.Lock()
++        self.live: set[Request] = set()
++        self.totals: dict[str, float] = dict.fromkeys(("requests_total", "prompt_tokens_total",
++                                                       "completion_tokens_total", *STATS.values()), 0)
++
++    @contextmanager
++    def running(self, prompt: int, out: list[int], arrived: float | None = None):
++        """Count a request as running while its ``generate`` runs, then fold its reply and ``stats`` into the totals."""
++
++        request = Request(prompt, out, arrived)
++        with self.lock:
++            self.live.add(request)
++        try:
++            yield request
++        finally:
++            with self.lock:
++                self.live.discard(request)
++                self._fold(request)
++            self._metrics(request)
++
++    def _fold(self, request: Request) -> None:
++        t = self.totals
++        t["requests_total"] += 1
++        t["prompt_tokens_total"] += request.prompt
++        t["completion_tokens_total"] += len(request.out)
++        for key, name in STATS.items():
++            value = (request.stats or {}).get(key)
++            if isinstance(value, (int, float)) and not isinstance(value, bool):
++                t[name] += value
++
++    def _metrics(self, request: Request) -> None:
++        stats = request.stats or {}
++        ended = time.perf_counter()
++        # The engine's own decode time when it reports one (the same figure /health sums); else first token to end.
++        decode = stats.get("decode_s")
++        if not isinstance(decode, (int, float)) or isinstance(decode, bool):
++            decode = (ended - request.first) if request.first is not None else None
++        metrics.note(getattr(self, "app", None), prompt=request.prompt, generation=len(request.out),
++                     drafted=_stat(stats, "drafted"), accepted=_stat(stats, "accepted"),
++                     latency=max(0.0, ended - request.started),
++                     ttft=(request.first - request.started) if request.first is not None else None,
++                     decode=None if decode is None else max(0.0, float(decode)))
++
++    def snapshot(self, app) -> dict[str, Any]:
++        """The counters now: finished totals, live replies' tokens so far, and a concurrent engine's streams."""
++
++        with self.lock:
++            body: dict[str, Any] = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in self.totals.items()}
++            body["completion_tokens_total"] += sum(len(r.out) for r in self.live)
++            running = len(self.live)
++        body = {"ok": True, "backend": "tensorfold", "busy": running > 0, "requests_running": running, **body}
++        scheduler = getattr(getattr(app, "engine", None), "scheduler", None)     # /health answers whatever the app
++        decoder = getattr(scheduler, "decoder", None)
++        if decoder is not None:                         # read, never locked: sizes of the decoder's own tables
++            body["streams"] = {"decoding": len(getattr(decoder, "streams", ())),
++                               "prefilling": len(getattr(decoder, "filling", ())), "max": scheduler.max_streams}
++        window = getattr(app, "effective_context_window", None)
++        if window:
++            body["context_length"] = int(window)
++        return body
++
++
++def of(app) -> Health:
++    """The app's counters, made on first use."""
++
++    with _MADE:
++        found = app.__dict__.get("health")
++        if found is None:
++            found = app.__dict__["health"] = Health()
++        found.app = app
++        return found
++
++
++def _stat(stats: dict[str, Any], key: str) -> int:
++    value = stats.get(key)
++    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
++
++
++__all__ = ["Health", "Request", "of"]
 diff --git tensorfold/families/glm5_next/__init__.py tensorfold/families/glm5_next/__init__.py
-index a2f4a6f..90cb8f3 100644
+index d3b7528..35b2463 100644
 --- tensorfold/families/glm5_next/__init__.py
 +++ tensorfold/families/glm5_next/__init__.py
 @@ -223,7 +223,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
@@ -167,7 +287,7 @@ index 93ab4dc..eb427d0 100644
      """A prompt's rows into the MTP cache through the prefill buffers (the prefill arithmetic, like the prompt)."""
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 1a65d1c..6b796d7 100644
+index bc3c677..1917b68 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -248,6 +248,44 @@ def round_costs(costs: dict) -> tuple[float, ...]:
@@ -247,7 +367,7 @@ index 1a65d1c..6b796d7 100644
 +        self.parallel = parallel
          self.policy = "0" if serial_only else policy
          self.serial_only = serial_only
-         self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
+         self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
 @@ -348,7 +395,7 @@ class GlmEngine:
          kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
          weights_estimate = kvb_weights(weights_estimate, kvb)
@@ -408,7 +528,7 @@ index 1a65d1c..6b796d7 100644
          positions: list[int] = []
          feed = None
          if vision is not None:               # encoded here, before rank 1 is told anything, so a failure stops both
-@@ -900,6 +1011,9 @@ class GlmEngine:
+@@ -941,6 +1052,9 @@ class GlmEngine:
      def follow(self) -> None:
          """Rank 1: mirror every request rank 0 serves, forever."""
  
@@ -418,11 +538,665 @@ index 1a65d1c..6b796d7 100644
          while True:
              self.follow_one()
  
+diff --git tensorfold/families/glm5_next/cuda/engine.py.orig tensorfold/families/glm5_next/cuda/engine.py.orig
+index 91446ca..bc3c677 100644
+--- tensorfold/families/glm5_next/cuda/engine.py.orig
++++ tensorfold/families/glm5_next/cuda/engine.py.orig
+@@ -12,10 +12,13 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ DEFAULT_POLICY = "auto"
+-DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
++# DFlash2 drafts every round: by default up to 5 while their probability product holds 0.3; TF_GLM_DFLASH_POLICY picks
++# another DFlash2 policy (e.g. fnc7:0.3, the noise-aware stop rule) for requests that name none
++DFLASH_POLICY = os.environ.get("TF_GLM_DFLASH_POLICY", "").strip() or "fc5:0.3"
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+-GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+-MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
++GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows (and MTP steps) captured as CUDA graphs; wider ones run eagerly
++MAX_ROWS = 16                         # the widest verify window (a pending token and up to 15 drafts: copy drafts)
++MTP_ROWS = 8                          # rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
+ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+@@ -37,12 +40,129 @@ def vision_workspace() -> int:
+     return int(value) * 2**20
+ 
+ 
++GRIDS = (16, 32, 64, 128)             # TF_GLM_PROMPT_GRID's values besides 0 (off)
++
++
++def prompt_grid(prefill_rows: int, value: str | None = None) -> int:
++    """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
++
++    With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
++    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly."""
++
++    value = os.environ.get("TF_GLM_PROMPT_GRID", "") if value is None else value
++    value = value.strip()
++    if value in ("", "0"):
++        return 0
++    if not value.isdecimal() or int(value) not in GRIDS:
++        raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
++    grid = int(value)
++    if prefill_rows % grid:
++        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: prompt chunks of {prefill_rows} rows (TF_GLM_PREFILL_ROWS) "
++                         f"must be a multiple of it")
++    return grid
++
++
++def grid_point(n: int, cut: int, grid: int) -> int | None:
++    """Where a drafted request of an n-token prompt resumed at ``cut`` keeps its prompt state, or None for nowhere.
++
++    Off (grid 0) and on-grid prompts: at n. Otherwise at B = floor(n / grid) * grid, when B lies past ``cut`` (so
++    B > 0); the request then prefills up to B, keeps that state, and resumes from it to n."""
++
++    if not grid or n % grid == 0:
++        return n
++    point = n // grid * grid
++    return point if point > cut else None
++
++
++SHARED_DEFAULT = 256                  # TF_GLM_SHARED_PREFIX=1: the fewest tokens a shared-prefix state adds
++SHARED_MIN = 16
++SHARED_MOST = 2                       # shared-prefix states a request keeps at most (the header's two slots)
++
++
++def shared_prefix(value: str | None = None) -> int:
++    """TF_GLM_SHARED_PREFIX: 0 (off, the default), or the fewest tokens past a request's resume point a shared-prefix
++    state must add (1 or on: 256; else 16 or more).
++
++    On, a drafted text request also keeps its state where its prompt stops sharing a kept one and at the end of its
++    system block (its first user message), each on the prompt grid, so a later prompt sharing only that prefix resumes
++    from it; saved states keep DFlash2's context window too."""
++
++    value = os.environ.get("TF_GLM_SHARED_PREFIX", "") if value is None else value
++    value = value.strip().lower()
++    if value in ("", "0", "off"):
++        return 0
++    if value in ("1", "on"):
++        return SHARED_DEFAULT
++    if not value.isdecimal() or int(value) < SHARED_MIN:
++        raise ValueError(f"TF_GLM_SHARED_PREFIX: 0 (off), 1 (on: {SHARED_DEFAULT} tokens) or the fewest tokens a "
++                         f"shared-prefix state adds past a request's resume point, {SHARED_MIN} or more; not {value!r}")
++    return int(value)
++
++
++def common_prefix(a, b) -> int:
++    """How many leading tokens two id sequences (lists or int64 arrays) share."""
++
++    import numpy as np
++
++    n = min(len(a), len(b))
++    if n == 0:
++        return 0
++    x = np.asarray(a[:n], dtype=np.int64)
++    y = np.asarray(b[:n], dtype=np.int64)
++    diff = np.flatnonzero(x != y)
++    return int(diff[0]) if len(diff) else n
++
++
++def shared_points(prompt: list[int], cut: int, point: int | None, grid: int, least: int, known,
++                  opener: int | None = None) -> list[int]:
++    """Where a request resumed at ``cut``, keeping its own state at ``point`` (``grid_point``), also keeps shared-prefix
++    states: at the longest prefix it shares with any of ``known`` (id sequences: the kept prompts; not the live reply,
++    which a conversation's next prompt extends anyway) and at its first ``opener`` token (the end of the system block),
++    each rounded down to the grid, kept when it adds at least ``least`` tokens past ``cut`` (and past the other point)
++    and lies short of ``point``. Sorted, at most SHARED_MOST."""
++
++    if not least or point is None:
++        return []
++    import numpy as np
++
++    arr = np.asarray(prompt, dtype=np.int64)
++    # only a sequence longer than cut + least can share enough (known may hold int64 arrays of the ids)
++    wanted = [max((common_prefix(arr, ids) for ids in known if len(ids) >= cut + least), default=0)]
++    if opener is not None:
++        at = np.flatnonzero(arr == opener)
++        if len(at):
++            wanted.append(int(at[0]))
++    out: list[int] = []
++    for p in sorted(p // grid * grid if grid else p for p in wanted):
++        if p - (out[-1] if out else cut) >= least and p < point:
++            out.append(p)
++    return out[-SHARED_MOST:]
++
++
++def user_opener(model_dir: Path) -> int | None:
++    """The id of GLM's ``<|user|>`` role token (the first one ends the system block), or None without a tokenizer."""
++
++    path = Path(model_dir) / "tokenizer.json"
++    if not path.is_file():
++        return None
++    try:
++        added = json.loads(path.read_text()).get("added_tokens", [])
++    except (OSError, ValueError):
++        return None
++    return next((int(t["id"]) for t in added if t.get("content") == "<|user|>"), None)
++
++
+ def encode_policy(spec: str) -> list[int]:
+-    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
++    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2.
++
++    DFlash2 only: ``fncN:P[:B]`` (kind 16: the fcN:P product of noise-aware confidences, B their temperature,
++    default ``dflash2.NOISY_BETA``) and ``fcostN:noisy[:B]`` (kind 17: the depth k <= N maximizing E[tokens] / round
++    ms by the startup cost table, E from the same confidences; N up to the captured verify windows' drafts)."""
+ 
+     spec = str(spec).strip()
+     bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, or one of "
+-                     f"these after f (N from 1 to {MAX_ROWS - 1})")
++                     f"these after f (N from 1 to {MAX_ROWS - 1}), fncN:P[:B] or fcostN:noisy[:B] "
++                     f"(N up to {len(GRAPH_ROWS) - 1})")
+     try:
+         if spec == "auto" or spec.startswith("auto:"):
+             parts = spec.split(":")
+@@ -52,6 +172,8 @@ def encode_policy(spec: str) -> list[int]:
+             if explore < 1 or every < 0 or not 0 <= margin < 1:
+                 raise bad
+             return [4 if len(parts) == 1 else 5, explore, every, int(round(margin * 1e6))]
++        if spec.startswith(("fnc", "fcost")):
++            return _encode_noisy(spec[1:], bad)
+         if spec.startswith("f"):
+             code = encode_policy(spec[1:])
+             return [code[0] + 10] + code[1:] if code[0] else code
+@@ -75,8 +197,30 @@ def encode_policy(spec: str) -> list[int]:
+     return [1 if most > 0 else 0, most, 0, 0]
+ 
+ 
+-def decode_policy(code: list[int]):
+-    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings."""
++def _encode_noisy(spec: str, bad: ValueError) -> list[int]:
++    """``ncN:P[:B]`` -> [16, N, P, B] and ``costN:noisy[:B]`` -> [17, N, B, 0], P and B in millionths (DFlash2 only)."""
++
++    from .dflash2 import NOISY_BETA
++
++    cost = spec.startswith("cost")
++    parts = spec[4 if cost else 2:].split(":")
++    if len(parts) not in (2, 3) or (cost and parts[1] != "noisy"):
++        raise bad
++    most = int(parts[0])
++    beta = float(parts[2]) if len(parts) == 3 else NOISY_BETA
++    if not 0 < most <= len(GRAPH_ROWS) - 1 or not 0 < beta <= 1000 or round(beta * 1e6) < 1:
++        raise bad
++    if cost:
++        return [17, most, int(round(beta * 1e6)), 0]
++    conf = float(parts[1])
++    if not 0 <= conf <= 1:
++        raise bad
++    return [16, most, int(round(conf * 1e6)), int(round(beta * 1e6))]
++
++
++def decode_policy(code: list[int], costs: dict | None = None):
++    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings; ``costs``: the
++    startup cost table (``GlmEngine._calibrate``) the fcost rule weighs a round's depths by."""
+ 
+     from .decode import DepthPolicy
+ 
+@@ -88,9 +232,22 @@ def decode_policy(code: list[int]):
+         return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
+     if kind == 3:
+         return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6)
++    if kind == 6:
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6, beta=b / 1e6)
++    if kind == 7:
++        if costs is None:
++            raise ValueError("the fcost policy needs the engine's cost table")
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, beta=a / 1e6, round_ms=round_costs(costs))
+     return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
+ 
+ 
++def round_costs(costs: dict) -> tuple[float, ...]:
++    """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
++    kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
++
++    return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
++
++
+ def _f64_ints(x: float) -> list[int]:
+     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
+ 
+@@ -124,11 +281,16 @@ def without_mtp(transform, layers: int):
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
++    shared = 0                  # TF_GLM_SHARED_PREFIX (``shared_prefix``): 0 off, else the fewest tokens it adds
++    opener = None               # rank 0, shared on: ``<|user|>``'s id, whose first appearance ends the system block
++
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+-                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False) -> None:
++                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
++                 split=None) -> None:
+         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+-        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows)."""
++        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows); ``split``: a ``hcsplit.SplitSettings``
++        instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests)."""
+ 
+         import torch
+ 
+@@ -141,6 +303,18 @@ class GlmEngine:
+                                               split_weights)
+ 
+         encode_policy(policy)                           # a bad default fails here, not in the first request
++        if not encode_policy(DFLASH_POLICY)[0] >= 10:
++            raise ValueError(f"TF_GLM_DFLASH_POLICY={DFLASH_POLICY!r}: a DFlash2 policy (f...), e.g. fc5:0.3 or fnc7:0.3")
++        from .copy_drafts import CopySettings
++
++        # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
++        # the MTP head and DFlash2; both ranks must agree, so the settings join the startup comparison below
++        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
++        from .hcsplit import SplitSettings
++
++        # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
++        # ranks (and its exchanges overlapped); the same bits, both ranks must agree (the comparison below)
++        self.split = SplitSettings.from_env() if split is None else split
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank = rank
+@@ -148,12 +322,21 @@ class GlmEngine:
+         self.serial_only = serial_only
+         self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
+         self.comm.barrier()
++        if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
++            # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
++            from tensorfold.cuda.roce import RoceComm
++
++            self.comm = RoceComm(self.comm, rank, 2)
++            if rank == 0:
++                print(f"[tensorfold] all-gathers up to {self.comm.roce.max_bytes >> 10} KiB over RoCE "
++                      f"({', '.join(self.comm.roce.hcas)}; b12x's RoCEnante transport), larger ones over NCCL",
++                      flush=True)
+         cfg = Config.read(model_dir)
+         # Without --context the window stays dense, attending every key without indexer work.
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+ 
+-        from .qmm import dense_kind, fp8_weights, q4_weights
++        from .qmm import KVB_KINDS, dense_kind, fp8_weights, kvb_kind, kvb_weights, q4_weights
+ 
+         # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
+         weights_estimate = split_weights(rule)
+@@ -161,6 +344,9 @@ class GlmEngine:
+             weights_estimate = fp8_weights(weights_estimate)
+         elif cfg.quant == "exl3" and dense_kind() == "q4":
+             weights_estimate = q4_weights(weights_estimate)
++        # TF_GLM_KVB=fp8/q4 (an EXL3 checkpoint, latent cache): kv_b as the absorb and expand kernels read it
++        kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
++        weights_estimate = kvb_weights(weights_estimate, kvb)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+         if not self.mtp_on:
+@@ -172,6 +358,11 @@ class GlmEngine:
+         prefill_rows = int(prefill_rows)
+         if not 64 <= prefill_rows <= 16384 or prefill_rows % 64:
+             raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
++        # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them
++        self.grid = prompt_grid(prefill_rows)
++        # TF_GLM_SHARED_PREFIX: kept states where prompts stop sharing, and saved states keep DFlash2's window; rank 0
++        # picks the points (the header carries them), but both ranks save and evict alike, so both must agree
++        self.shared = shared_prefix()
+         vision = bool(vision) and rank == 0
+         workspace = vision_workspace() if vision else 0
+         if vision:                           # the tower's bf16 weights, which the split rule drops
+@@ -181,11 +372,15 @@ class GlmEngine:
+             weights_estimate = lambda name, info: ((math.prod(info["shape"]) * 2, 0)
+                                                    if name.startswith("model.visual.") else text_weights(name, info))
+ 
++        from .exl3_mm import prompt_kernels
++        from .latent import SPARSE_ONEPASS
++
+         def geometry(text):
+             from tensorfold.cuda.capacity import Geometry
+ 
+             g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
+-                             mtp=self.mtp_on)
++                             mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
++                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4")
+             return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+                                    geometry,
+@@ -195,9 +390,17 @@ class GlmEngine:
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+         long_context = self.limit > cfg.dense_limit
++        # TF_GLM_DRAFT_DUMP=<dir>: DFlash2 requests decode serially and record the drafter's view for the offline
++        # simulator (``draft_dump``, ``draft_sim``); TF_GLM_DRAFT_QUANT=minmax|mse: how DFlash2's 4-bit copies are made
++        from .draft_dump import dump_dir
++        from .qmm import DRAFT_QUANTS, draft_quant
++
++        self.dump = dump_dir() if drafter is not None and not serial_only else None
++        quant_code = DRAFT_QUANTS.index(draft_quant())
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
++                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
++            self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -205,7 +408,9 @@ class GlmEngine:
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
++                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
++                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
++                               "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -232,9 +437,29 @@ class GlmEngine:
+         if drafter is not None:
+             from .dflash2 import Drafter
+ 
+-            self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
+-        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
+-                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
++            self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
++        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
++                        graph_rows=GRAPH_ROWS, long_context=long_context,
++                        taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
++                        split=self.split, mtp_rows=MTP_ROWS)
++        if self.e.pbuf.split is not None:
++            self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
++            if rank == 0:
++                print(f"[tensorfold] {self.split.describe()}", flush=True)
++        if rank == 0 and self.dump is not None:
++            print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
++                  f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
++        if rank == 0 and quant_code:
++            print("[tensorfold] TF_GLM_DRAFT_QUANT=mse: DFlash2's 4-bit copies (and an EXL3 draft head) with "
++                  "least-squares clipped ranges", flush=True)
++        if rank == 0 and self.grid:
++            print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
++                  f"(TF_GLM_PROMPT_GRID)", flush=True)
++        # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
++        self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
++        if rank == 0 and self.shared:
++            print(f"[tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end "
++                  f"of its system block, when they add {self.shared}+ tokens (TF_GLM_SHARED_PREFIX)", flush=True)
+         if self.drafter is not None:
+             self.drafter.capture()
+         self.costs = self._calibrate()
+@@ -283,7 +508,7 @@ class GlmEngine:
+             return [int(t) for t in rng.integers(0, vocab, n)]
+ 
+         prefill(e, tokens(64), None, mtp=True, drafter=self.drafter)
+-        hidden = e.pbuf.fnormed[:MAX_ROWS].clone()          # rows for timing the draft steps
++        hidden = e.pbuf.fnormed[:8].clone()                 # rows for timing the draft steps
+         one, six = tokens(1), tokens(6)
+         start = st.mtp_len
+ 
+@@ -291,7 +516,10 @@ class GlmEngine:
+             st.set_mtp_len(start)
+             st.mtp_drafted = 0
+ 
+-        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, MAX_ROWS + 1)}
++        # the verify windows the drafters' rounds use (MTP chains of 3, DFlash2 blocks of 5: the captured graphs);
++        # wider (copied) windows are not the choice's, and their eager launches would bend the fitted line
++        widest = max(GRAPH_ROWS)
++        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, widest + 1)}
+         if self.w.mtp is not None:
+             pieces["m1"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 1, None), rewind)
+             pieces["m3"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 3, None), rewind)
+@@ -330,7 +558,7 @@ class GlmEngine:
+         e.reset()
+         if self.drafter is not None:
+             self.drafter.reset()
+-        rows = list(range(2, MAX_ROWS + 1))
++        rows = list(range(2, widest + 1))
+         ys = [both[f"v{r}"] for r in rows]
+         slope = statistics.median((ys[j] - ys[i]) / (rows[j] - rows[i]) for i in range(len(rows))
+                                   for j in range(i + 1, len(rows)))
+@@ -412,6 +640,7 @@ class GlmEngine:
+         best = None
+         for snap in self.cache:
+             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
++            fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
+             if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+                 best = snap
+@@ -439,6 +668,7 @@ class GlmEngine:
+         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
+         from .decode import row_bytes, save_rows
+ 
++        drafter = self._kept_drafter()
+         live = self.live
+         dropped = False
+ 
+@@ -452,7 +682,7 @@ class GlmEngine:
+             if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
+                 self._drop(snap)
+                 continue
+-            need = row_bytes(self.e, snap)
++            need = row_bytes(self.e, snap, drafter=drafter)
+             while self._held_bytes() + need > self.cache_bytes:
+                 old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
+                 if old is None:
+@@ -463,29 +693,52 @@ class GlmEngine:
+                 self._drop(snap)
+                 dropped = True
+                 continue
+-            save_rows(self.e, snap)
++            save_rows(self.e, snap, drafter=drafter)
+         if dropped:
+             import torch
+ 
+             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
+ 
++    def _kept_drafter(self):
++        """The drafter whose context window saved snapshots keep (TF_GLM_SHARED_PREFIX), or None: they drop it."""
++
++        return getattr(self, "drafter", None) if self.shared else None
++
++    def _shared(self, prompt: list[int], hit) -> list[int]:
++        """Rank 0: the shared-prefix points a drafted text request keeps (``shared_points``), sent to rank 1."""
++
++        if not self.shared:
++            return []
++        import numpy as np
++
++        cut = len(hit.ids) if hit is not None else 0
++        known = []
++        for c in self.cache:                  # a kept prompt's ids as an array, made once (ids never change)
++            if getattr(c, "ids_array", None) is None:
++                c.ids_array = np.asarray(c.ids, dtype=np.int64)
++            known.append(c.ids_array)
++        return shared_points(prompt, cut, grid_point(len(prompt), cut, self.grid), self.grid, self.shared, known,
++                             self.opener)
++
+     def _held_bytes(self) -> int:
+         from .decode import snapshot_bytes
+ 
+         return sum(snapshot_bytes(c) for c in self.cache)
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, constraint=None, feed=None) -> dict[str, Any]:
++             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=()) -> dict[str, Any]:
++        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at."""
++
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed)
++            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
+         finally:
+             self.e.constraint = self.e.window = None
+ 
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+-                  feed=None) -> dict[str, Any]:
+-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
++                  feed=None, shared=()) -> dict[str, Any]:
++        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+         auto, use_mtp, use_dflash = self._drafters(code)
+@@ -497,20 +750,62 @@ class GlmEngine:
+         cut = len(hit.ids) if hit is not None else 0
+         self._take_over(list(hit.ids) if hit is not None else [])
+         if hit is not None and hit.rows is not None:
+-            load_rows(self.e, hit)
++            load_rows(self.e, hit, drafter=self._kept_drafter())
+             hit.rows, hit.nbytes = None, 0            # live again
+         # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
+         self.live = list(prompt) if feed is None else []
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, feed=feed,
+-                        keep_at=max(1, len(prompt) - 1) if draft and feed is None else None, keep=self._remember)
++        # a drafted text prompt keeps its state at ``point``: its end, or with TF_GLM_PROMPT_GRID the last grid
++        # multiple in it. Short of the end, the prompt prefills to the point as a prompt of that length would (no
++        # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
++        # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
++        point = grid_point(len(prompt), cut, self.grid) if draft and feed is None else None
++        # TF_GLM_SHARED_PREFIX: rank 0's shared-prefix points (past the resume point, short of ``point``) are kept the
++        # same way, each prefilled to as a prompt of its length and resumed from, so fresh and resumed prompts pass
++        # through the same states there too
++        stops = sorted(p for p in set(shared) if point is not None and cut < p < point)
++        stats: dict[str, Any] = {"shared": list(stops)} if stops else {}
++        if point is not None and point < len(prompt):
++            stops.append(point)
++        resume, kept = hit, []
++        for stop in stops:
++            head = list(prompt[:stop])
++            prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=resume, sample=False)
++            resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                   drafter=drafter)
++            kept.append(resume)
++        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed)
+         prefill_s = time.perf_counter() - t0
+-        stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
++        if point == len(prompt):
++            kept.append(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                      drafter=drafter))
++        if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
++            self.cache = [c for c in self.cache if c is not hit] + [hit]
++        for snap in kept:
++            self._remember(snap)
++        if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
++            self.cache = [c for c in self.cache if c is not hit] + [hit]
++        stats.update(prefill_s=prefill_s, cached=cut)
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+-        policy = decode_policy(code)
++        policy = decode_policy(code, self.costs)
++        copies = None
++        if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
++            from .copy_drafts import CopyDrafts
++
++            copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
++        elif self.dump is not None and drafter is not None:      # serial's reply, the drafter's view recorded
++            from .draft_dump import dump_decode
++
++            meta = None if self.rank else dict(
++                prompt_tokens=len(prompt), cached=cut, policy=list(code), images=feed is not None,
++                prompt_sha256=hashlib.sha256(json.dumps(list(prompt)).encode()).hexdigest()[:16])
++            res = dump_decode(self.e, drafter, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
++                              out_dir=self.dump if self.rank == 0 else None, meta=meta)
++            if self.rank == 0:
++                stats["draft_dump"] = res.dump_path
+         elif auto:
+             greedy = sampling is None or sampling.temperature <= 0
+             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+@@ -521,13 +816,13 @@ class GlmEngine:
+                                        margin=margin)
+             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
+                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
+-                              on_tokens=on_tokens)
++                              on_tokens=on_tokens, copies=copies)
+         elif use_dflash:
+             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+-                                on_tokens=on_tokens)
++                                on_tokens=on_tokens, copies=copies)
+         else:
+             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+-                             on_tokens=on_tokens)
++                             on_tokens=on_tokens, copies=copies)
+         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
+         if feed is None:
+             self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+@@ -538,6 +833,8 @@ class GlmEngine:
+             stats.update(drafters=res.arms, keeps=res.keeps)
+         if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report
+             stats.update(drafted=res.drafted, accepted=res.accepted)
++        if copies is not None:
++            stats.update(copy_rounds=res.copy_rounds, copy_drafted=res.copy_drafted, copy_accepted=res.copy_accepted)
+         if res.stages:
+             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
+         return stats
+@@ -574,12 +871,14 @@ class GlmEngine:
+             feed = VisionFeed(self, positions, rows)
+             feed.encode_s = time.perf_counter() - t
+         hit = self._resume(list(prompt), code) if draft and feed is None else None
++        shared = self._shared(list(prompt), hit) if draft and feed is None else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
+-                  int(constraint is not None), len(positions)] + code
++                  int(constraint is not None), len(positions),
++                  *(shared + [0] * SHARED_MOST)[:SHARED_MOST]] + code
+         from tensorfold.engine.grammar import pack
+ 
+         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
+@@ -589,8 +888,11 @@ class GlmEngine:
+             self._share(pack(constraint))
+         if positions:
+             self._share(positions)
+-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed)
++        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
++                          shared)
+         stats.update(policy=spec, drafts=draft)
++        if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
++            self.comm.check()
+         if feed is not None:
+             stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3))
+         return stats
+@@ -639,8 +941,15 @@ class GlmEngine:
+     def follow(self) -> None:
+         """Rank 1: mirror every request rank 0 serves, forever."""
+ 
++        while True:
++            self.follow_one()
++
++    def follow_one(self) -> None:
++        """Rank 1: mirror one request rank 0 serves."""
++
+         from tensorfold.engine.exact_sampling import Sampling
+ 
++
+         while True:
+             self._await_bell()
+             header = self._share(None)
+@@ -650,7 +959,8 @@ class GlmEngine:
+                 self._score_local(prompt, labels)
+                 continue
+             (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
+-              images, *code) = header
++              images, *rest) = header
++            shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
+             prompt = self._share(None)
+             packed = self._share(None) if shaped else []
+             constraint = None
+@@ -669,7 +979,9 @@ class GlmEngine:
+                 if hit is None:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                      constraint, feed)
++                      constraint, feed, shared)
++            if hasattr(self.comm, "check"):
++                self.comm.check()
+ 
+ 
+ class VisionFeed:
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index cb39952..e156332 100644
+index 30d49bc..53017b6 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -161,52 +161,137 @@ class Buffers:
+@@ -163,52 +163,137 @@ class Buffers:
          return p
  
  
@@ -591,7 +1365,7 @@ index cb39952..e156332 100644
  
      def reset(self) -> None:
          self.conv.zero_()
-@@ -229,9 +314,11 @@ class State:
+@@ -231,9 +316,11 @@ class State:
          return self.cur[0] if self.cur else 0
  
      def clone(self) -> "State":
@@ -603,7 +1377,7 @@ index cb39952..e156332 100644
          other.conv = self.conv.clone()
          other.rec = self.rec.clone()
          other.cur = list(self.cur)
-@@ -314,6 +401,30 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+@@ -316,6 +403,30 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
          return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
  
  
@@ -634,7 +1408,7 @@ index cb39952..e156332 100644
  def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
                R: int, nch: int | None, index=None, host_pos: int | None = None,
                sparse_np: int | None = None) -> torch.Tensor:
-@@ -539,13 +650,16 @@ def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
+@@ -541,13 +652,16 @@ def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
  
  
  def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
@@ -653,7 +1427,7 @@ index cb39952..e156332 100644
      with prof.timed("hc"):
          glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
          h = layer.ffn_hc
-@@ -606,7 +720,7 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+@@ -608,7 +722,7 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
  
  
  def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
@@ -662,7 +1436,7 @@ index cb39952..e156332 100644
      """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
  
      c = w.cfg
-@@ -614,11 +728,11 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+@@ -616,11 +730,11 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
      if inject is not None:
          rows, features = inject
          b.x.index_copy_(0, rows, features.repeat(1, c.streams))
@@ -676,6 +1450,59 @@ index cb39952..e156332 100644
              for slot in b.tap_at.get(layer.index, ()):
                  glue.stream_mean(b.x[:R], b.taps[slot][:R])
          glue.stream_mean(b.x[:R], b.hidden[:R])
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 9fcb76a..30d49bc 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -431,6 +431,48 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
+ 
+ 
++def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
++                 select: bool = True) -> torch.Tensor | None:
++    """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
++    streams' rows back to back, each stream's latents (lc), index keys, gates and pooled keys (index: arenas) in
++    its own extent. Each segment's rows get the bits of that segment alone through dsa_block (the projections,
++    absorb and expand keep rows apart; the attention kernels are latent.seg_* / sparse.seg_*). Graphs: one per R
++    covers every position mix. ``select`` False skips the token selection (eager windows with no sparse row:
++    ``rows.any_sparse()``); ``sel``: segments.SelectScratch, needed with an index."""
++
++    c = w.cfg
++    a = layer.dsa
++    if a.absorb is None:
++        raise ValueError("segmented windows need the latent cache (TF_GLM_LATENT=1)")
++    mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
++    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
++    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
++    HL = a.heads
++    mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
++    s = b.lat_s
++    with prof.timed("dsa: latent write"):
++        latent.seg_latent_write(b.lat[:R], lc, rows)
++    tokens = counts = None
++    if index is not None:
++        ik, ig, pk = index
++        ix = a.index
++        with prof.timed("dsa: indexer update"):
++            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
++            glue.router(b.normed[:R], ix.gate, b.igr[:R])
++            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
++        if select:
++            with prof.timed("dsa: select tokens"):
++                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
++                tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
++    with prof.timed("dsa: attention"):
++        ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
++    with prof.timed("dsa: expand"):
++        o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++
++
+ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     m = layer.mlp
+     mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
 new file mode 100644
 index 0000000..f62a69d

@@ -68,7 +68,7 @@ index 127ea01..b5dcd26 100644
          return out
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 66fa9ca..32c01f3 100644
+index a8408b4..9e4817a 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -502,17 +502,24 @@ class GlmEngine:

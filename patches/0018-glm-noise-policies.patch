@@ -139,7 +139,7 @@ index 62c9373..25947bb 100644
 +                              round_ms=round_ms)
          return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index c4b826e..b626ecf 100644
+index 2a05621..3c14034 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -151,11 +151,16 @@ def user_opener(model_dir: Path) -> int | None:

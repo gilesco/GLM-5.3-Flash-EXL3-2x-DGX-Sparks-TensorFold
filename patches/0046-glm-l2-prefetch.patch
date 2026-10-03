@@ -17,19 +17,19 @@ index a117edc..9b80e31 100644
          if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
              from . import kda as kda_mod
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 1aab97c..60250c3 100644
+index e0808a9..89e45ed 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -12,7 +12,7 @@ from tensorfold.cuda import experts as grouped
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
  from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
  from tensorfold.cuda.kernels import prefill_attention, qmm as shared
  
--from . import glue, kda as kda_mod, kv8, latent, prof, qmm, sparse
-+from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
+-from . import exl3_generic, glue, kda as kda_mod, kv8, latent, prof, qmm, sparse
++from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
  from .attention import AttnScratch, attention, kv_write
  from .weights import LayerW, Weights
  
-@@ -415,7 +415,8 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+@@ -422,7 +422,8 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
      return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
  
  
@@ -39,7 +39,7 @@ index 1aab97c..60250c3 100644
      """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
      [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
      and runs hc_post itself (``hcsplit.HcSplit``)."""
-@@ -425,17 +426,20 @@ def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) ->
+@@ -432,17 +433,20 @@ def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) ->
          sp.partial(fill)
          return None
      fill(0, R)
@@ -62,7 +62,7 @@ index 1aab97c..60250c3 100644
  
  
  def undone(R: int, done: tuple[int, int] | None) -> list[tuple[int, int]]:
-@@ -478,6 +482,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+@@ -485,6 +489,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
              ga = p[:, k.ga_off:k.ga_off + 128]
              mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
              mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
@@ -70,7 +70,7 @@ index 1aab97c..60250c3 100644
      cur = st.cur[li]
      with prof.timed("kda: recurrence"):
          out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
-@@ -487,7 +492,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+@@ -494,7 +499,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
          st.cur[li] = 1 - cur
          _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
      with prof.timed("kda: out + all-gather"):
@@ -79,7 +79,7 @@ index 1aab97c..60250c3 100644
  
  
  def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tensor, slots: "Slots",
-@@ -506,12 +511,13 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
+@@ -513,12 +518,13 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
          ga = p[:, k.ga_off:k.ga_off + 128]
          mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
          mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
@@ -94,7 +94,7 @@ index 1aab97c..60250c3 100644
  
  
  def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
-@@ -536,7 +542,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+@@ -543,7 +549,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
          dsa_front(layer, w, b, lo, hi)
      HL = a.heads
      if a.absorb is not None:
@@ -103,7 +103,7 @@ index 1aab97c..60250c3 100644
      if sparse_np is not None:
          raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
      mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
-@@ -594,7 +600,7 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
+@@ -601,7 +607,7 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
  
  
  def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
@@ -112,7 +112,7 @@ index 1aab97c..60250c3 100644
      """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
  
      c = w.cfg
-@@ -614,6 +620,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -621,6 +627,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
              sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
      with prof.timed("dsa: absorb"):
          qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
@@ -120,7 +120,7 @@ index 1aab97c..60250c3 100644
      ol = s.ol[:R]
      scale = c.qk_dim ** -0.5
      if not all_sparse:
-@@ -635,7 +642,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -642,7 +649,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
                  latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
      with prof.timed("dsa: expand"):
          o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
@@ -129,7 +129,7 @@ index 1aab97c..60250c3 100644
  
  
  def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
-@@ -673,11 +680,12 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+@@ -680,11 +687,12 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
                  tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
      with prof.timed("dsa: absorb"):
          qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
@@ -143,7 +143,7 @@ index 1aab97c..60250c3 100644
  
  
  def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
-@@ -690,7 +698,7 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+@@ -697,7 +705,7 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
      m = layer.mlp
      for lo, hi in undone(R, done):
          mlp_front(layer, w, b, lo, hi)
@@ -152,19 +152,21 @@ index 1aab97c..60250c3 100644
  
  
  def shared_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
-@@ -716,6 +724,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+@@ -721,6 +729,13 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
+     if m.shared is not None:
          # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-         from . import exl3_mm
- 
++        from . import exl3_mm
++
 +        if l2pf.ACTIVE is not None and done is None:
 +            # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
 +            # bits), while the L2 still holds what site "a" prefetched for it
 +            shared_front(layer, w, b, 0, R)
 +            done = (0, R)
          with prof.timed("moe: routed (exl3)"):
-             exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+             from . import exl3_mm
  
-@@ -732,7 +745,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+@@ -739,7 +754,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
                      b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
                      glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
  
@@ -173,7 +175,7 @@ index 1aab97c..60250c3 100644
      with prof.timed("moe: gate/up"):
          grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
      with prof.timed("moe: down"):
-@@ -742,7 +755,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+@@ -749,7 +764,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
          with prof.timed("moe: combine"):
              glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
  
@@ -182,7 +184,226 @@ index 1aab97c..60250c3 100644
  
  
  def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
-@@ -861,6 +874,22 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+@@ -868,6 +883,38 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+             host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
+     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
+ 
++    c = w.cfg
++    pf = w.meta.get("l2pf")
++    if pf is not None and not b.prefill and R <= pf.s.rows and l2pf.ACTIVE is None:
++        l2pf.ACTIVE = pf                 # TF_GLM_L2PF: this decode window's sites prefetch (joined below)
++        try:
++            return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, sparse_np=sparse_np,
++                            inject=inject, head=head, mixer=mixer)
++        finally:
++            pf.join()
++            l2pf.ACTIVE = None
++    return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, sparse_np=sparse_np, inject=inject,
++                    head=head, mixer=mixer)
++
++
++def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
++             host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
++    c = w.cfg
++    pf = w.meta.get("l2pf")
++    if pf is not None and not b.prefill and R <= pf.s.rows and l2pf.ACTIVE is None:
++        l2pf.ACTIVE = pf                 # TF_GLM_L2PF: this decode window's sites prefetch (joined below)
++        try:
++            return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, sparse_np=sparse_np,
++                            inject=inject, head=head, mixer=mixer)
++        finally:
++            pf.join()
++            l2pf.ACTIVE = None
++    return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, sparse_np=sparse_np, inject=inject,
++                    head=head, mixer=mixer)
++
++
++def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
++             host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+     if inject is not None:
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index e4786ed..f968ea1 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import exl3_generic, glue, kda as kda_mod, kv8, latent, prof, qmm, sparse
++from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -351,6 +351,11 @@ class State:
+         """The DSA caches' format (TF_GLM_KV): the pool's."""
+         return self.caches.kv
+ 
++    @property
++    def kv(self) -> str:
++        """The DSA caches' format (TF_GLM_KV): the pool's."""
++        return self.caches.kv
++
+     @property
+     def graph_key(self) -> tuple[int, int]:
+         """What a captured graph baked in besides the shared buffers: the slot and the extent's base."""
+@@ -417,7 +422,8 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+ 
+-def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) -> torch.Tensor | None:
++def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None, site: tuple | None = None
++             ) -> torch.Tensor | None:
+     """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
+     [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
+     and runs hc_post itself (``hcsplit.HcSplit``)."""
+@@ -427,17 +433,20 @@ def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) ->
+         sp.partial(fill)
+         return None
+     fill(0, R)
++    if site is not None and l2pf.ACTIVE is not None:      # TF_GLM_L2PF: the next reads into L2 during the gather
++        l2pf.ACTIVE.site(*site)
+     if label is None:
+         return gather(w, b, R)
+     with prof.timed(label):
+         return gather(w, b, R)
+ 
+ 
+-def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor | None:
++def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int,
++             site: tuple | None = None) -> torch.Tensor | None:
+     def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
+         mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
+ 
+-    return partials(w, b, R, fill)
++    return partials(w, b, R, fill, site=site)
+ 
+ 
+ def undone(R: int, done: tuple[int, int] | None) -> list[tuple[int, int]]:
+@@ -480,6 +489,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+             ga = p[:, k.ga_off:k.ga_off + 128]
+             mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+             mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++            l2pf.site(layer.index, "o")
+     cur = st.cur[li]
+     with prof.timed("kda: recurrence"):
+         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+@@ -489,7 +499,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+         st.cur[li] = 1 - cur
+         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+     with prof.timed("kda: out + all-gather"):
+-        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
++        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+ 
+ 
+ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tensor, slots: "Slots",
+@@ -508,12 +518,13 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
+         ga = p[:, k.ga_off:k.ga_off + 128]
+         mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+         mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++        l2pf.site(layer.index, "o")
+     with prof.timed("kda: recurrence"):
+         out = kda_mod.chain_segments(seg, p, k.b_off, b.ka[:R], b.kg[:R], slots.conv[:, li], k.conv,
+                                      slots.rec[:, :, li], k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R,
+                                      scratch.views[li])
+     with prof.timed("kda: out + all-gather"):
+-        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R)
++        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+ 
+ 
+ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -538,7 +549,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+         dsa_front(layer, w, b, lo, hi)
+     HL = a.heads
+     if a.absorb is not None:
+-        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np)
++        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index)
+     if sparse_np is not None:
+         raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
+     mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
+@@ -596,7 +607,7 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
+ 
+ 
+ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
+-                index, host_pos: int | None, sparse_np: int | None = None) -> torch.Tensor:
++                index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1) -> torch.Tensor:
+     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
+ 
+     c = w.cfg
+@@ -616,6 +627,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+             sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+     with prof.timed("dsa: absorb"):
+         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
++    l2pf.site(layer, "o")
+     ol = s.ol[:R]
+     scale = c.qk_dim ** -0.5
+     if not all_sparse:
+@@ -637,7 +649,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+                 latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+ 
+ 
+ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
+@@ -675,11 +687,12 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+                 tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
+     with prof.timed("dsa: absorb"):
+         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
++    l2pf.site(layer.index, "o")
+     with prof.timed("dsa: attention"):
+         ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
+ 
+ 
+ def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -692,7 +705,7 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+     m = layer.mlp
+     for lo, hi in undone(R, done):
+         mlp_front(layer, w, b, lo, hi)
+-    return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
++    return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R, site=(layer.index, "f"))
+ 
+ 
+ def shared_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -716,6 +729,13 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
+     if m.shared is not None:
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
++        from . import exl3_mm
++
++        if l2pf.ACTIVE is not None and done is None:
++            # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
++            # bits), while the L2 still holds what site "a" prefetched for it
++            shared_front(layer, w, b, 0, R)
++            done = (0, R)
+         with prof.timed("moe: routed (exl3)"):
+             from . import exl3_mm
+ 
+@@ -734,7 +754,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+                     b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
+                     glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+ 
+-        return partials(w, b, R, fill, "moe: all-gather")
++        return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+     with prof.timed("moe: gate/up"):
+         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
+     with prof.timed("moe: down"):
+@@ -744,7 +764,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         with prof.timed("moe: combine"):
+             glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+ 
+-    return partials(w, b, R, fill, "moe: all-gather")
++    return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+ 
+ 
+ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+@@ -863,6 +883,22 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
              host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
      """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
  

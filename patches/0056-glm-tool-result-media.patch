@@ -1,12 +1,8 @@
-# Issue #28: pictures and clips in tool results render inside their <tool_response> instead of HTTP 400 (without
-# --vision: as the template's own "unable to process" reminder).
-# Reported by @d4rkdpg. MiaAI-Lab, Apache-2.0.
-
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index d44ae09..fb24558 100644
+index d65df9b..897dc75 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -210,7 +210,7 @@ class App:
+@@ -262,7 +262,7 @@ class App:
          if chat:
              if not isinstance(body.get("messages"), list):
                  raise RequestError("messages must be a list")
@@ -15,7 +11,7 @@ index d44ae09..fb24558 100644
  
              def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
                  try:
-@@ -219,14 +219,20 @@ class App:
+@@ -271,7 +271,12 @@ class App:
                  except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
                      raise RequestError(f"the chat template rejected the request: {exc}") from exc
  
@@ -28,7 +24,8 @@ index d44ae09..fb24558 100644
 +            elif has_images(body["messages"]):
                  rendered = prepare_images(self.vision, body["messages"],
                                            lambda messages: render(messages, allow_images=True),
-                                           context_limit=self._context_limit())
+                                           context_limit=self._context_limit(),
+@@ -279,7 +284,8 @@ class App:
                  return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                         self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                         vision=rendered.vision, grammar=compiled, think_budget=budget)
@@ -39,10 +36,10 @@ index d44ae09..fb24558 100644
          elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
              prompt = self.token_ids(body["prompt"])
 diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
-index 8a96996..161f218 100644
+index 0b2d762..0a8107c 100644
 --- tensorfold/families/glm5_next/cuda/app.py
 +++ tensorfold/families/glm5_next/cuda/app.py
-@@ -31,10 +31,12 @@ class ThinkingOffTemplate:
+@@ -34,10 +34,12 @@ class ThinkingOffTemplate:
  
  
  # the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
@@ -57,7 +54,7 @@ index 8a96996..161f218 100644
            "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>"
            "{%- else -%}" + _NO_MEDIA + "{%- endif -%}")
  
-@@ -51,6 +53,8 @@ def media_template(inner, model_dir) -> None:
+@@ -54,6 +56,8 @@ def media_template(inner, model_dir) -> None:
  
  class GlmApp(App):
      reads_ignore_eos = True             # ``run`` hands it to the engine's request
@@ -67,26 +64,158 @@ index 8a96996..161f218 100644
      def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
          super().__init__(engine, model_dir, served, **kwargs)
 diff --git tensorfold/server/messages.py tensorfold/server/messages.py
-index 2679969..4f2a4bf 100644
+index 313ca66..667ed8e 100644
 --- tensorfold/server/messages.py
 +++ tensorfold/server/messages.py
-@@ -49,7 +49,10 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
-         content = message.get("content")
-         if isinstance(content, list) and allow_images and any(
+@@ -52,6 +52,7 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
                  isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
--            if role != "user":
-+            # a tool result's pictures reach here only as the parts ``split_images`` makes of them, for a frontend
-+            # that renders them in place (``tool_media``); its raw image_url / video_url parts are refused
-+            if role != "user" and not (role == "tool" and all(
-+                    p.get("type") not in ("image_url", "video_url") for p in content if isinstance(p, dict))):
-                 raise RequestError("images and videos are supported only in user messages")
+             if role not in _IMAGE_ROLES:
+                 raise RequestError("images and videos are supported only in user and tool messages")
++
              for part in content:
                  if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
+                     raise RequestError("image messages may contain text and image_url (or video_url) parts only")
+diff --git tensorfold/server/messages.py.orig tensorfold/server/messages.py.orig
+new file mode 100644
+index 0000000..667ed8e
+--- /dev/null
++++ tensorfold/server/messages.py.orig
+@@ -0,0 +1,130 @@
++"""Text chat messages shared by the HTTP and template paths."""
++
++import json
++from typing import Any, Callable
++
++from tensorfold.server.errors import RequestError
++
++_MEDIA = ("image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url")
++_IMAGE_ROLES = ("user", "tool")    # a tool result may carry images (an agent's screenshots): templates render them
++
++
++def validate_modalities(body: dict[str, Any]) -> None:
++    if any(body.get(k) for k in _MEDIA) or body.get("modalities") not in (None, ["text"]):
++        raise RequestError("this server accepts and produces text only; image, audio and video are unsupported")
++
++
++_PROBE = "tensorfold-late-system-probe"
++
++
++def late_system_role(render: Callable[[list[dict[str, Any]]], Any]) -> str:
++    """``system`` when ``render`` (a chat template, as text) keeps a later system message in place, else ``user``."""
++
++    probe = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
++             {"role": "assistant", "content": "a"}, {"role": "system", "content": _PROBE},
++             {"role": "user", "content": "v"}]
++    try:
++        return "system" if _PROBE in str(render(probe)) else "user"
++    except Exception:  # noqa: BLE001 - a template that rejects the probe cannot render later system messages
++        return "user"
++
++
++_VISUAL = ("image_url", "image", "video_url", "video")      # a video part reaches here only where videos are on
++
++
++def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "system",
++                       allow_images: bool = False) -> list[dict[str, Any]]:
++    """Merge leading instructions as system text and retain later instructions as ``late_system`` so earlier conversation tokens stay unchanged."""
++
++    if not isinstance(messages, list) or not messages:
++        raise RequestError("messages must be a non-empty list")
++    out, instructions = [], []
++    for message in messages:
++        if not isinstance(message, dict):
++            raise RequestError("each message must be an object")
++        role = message.get("role")
++        if role not in ("system", "developer", "user", "assistant", "tool"):
++            raise RequestError("message role must be system, developer, user, assistant or tool")
++        if any(message.get(k) for k in _MEDIA):
++            raise RequestError("this server accepts text only; image, audio and video inputs are unsupported")
++        content = message.get("content")
++        if isinstance(content, list) and allow_images and any(
++                isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
++            if role not in _IMAGE_ROLES:
++                raise RequestError("images and videos are supported only in user and tool messages")
++
++            for part in content:
++                if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
++                    raise RequestError("image messages may contain text and image_url (or video_url) parts only")
++                if part["type"] == "text" and not isinstance(part.get("text"), str):
++                    raise RequestError("a text content part must contain a text string")
++            out.append({**message, "content": list(content)})
++            continue
++        if isinstance(content, list):
++            text = []
++            for part in content:
++                if (not isinstance(part, dict) or part.get("type") != "text"
++                        or any(part.get(k) for k in _MEDIA)):
++                    raise RequestError("this server accepts text parts only; image, audio and video inputs are unsupported")
++                if not isinstance(part.get("text"), str):
++                    raise RequestError("a text content part must contain a text string")
++                text.append(part["text"])
++            content = "".join(text)
++        elif content is None:
++            content = ""
++        elif not isinstance(content, str):
++            raise RequestError("message content must be text or an array of text parts")
++        item = message if content is message.get("content") else {**message, "content": content}
++        if (role == "assistant" and not isinstance(message.get("reasoning_content"), str)
++                and isinstance(message.get("reasoning"), str)):
++            # vLLM's newer replies and OpenRouter's name a step's reasoning ``reasoning``; templates read
++            # ``reasoning_content``, and without it a tool step's reasoning is dropped from the resent history
++            item = {**item, "reasoning_content": message["reasoning"]}
++        if role in ("system", "developer"):
++            if not out:
++                instructions.append(item)
++                continue
++            if role != late_system:
++                item = {**item, "role": late_system}
++        out.append(item)
++    if instructions:
++        out.insert(0, {**instructions[0], "role": "system",
++                       "content": "\n\n".join(m["content"] for m in instructions)})
++    return messages if out == messages else out
++
++
++def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Copy tool arguments into mappings for templates; invalid ones go under ``_invalid_arguments``, not a crash."""
++
++    if not messages:
++        return messages
++    out: list[dict[str, Any]] = []
++    changed = False
++    for message in messages:
++        calls = message.get("tool_calls") if isinstance(message, dict) else None
++        if not calls:
++            out.append(message)
++            continue
++        new_calls = []
++        touched = False
++        for call in calls:
++            fn = call.get("function") if isinstance(call, dict) else None
++            args = fn.get("arguments") if isinstance(fn, dict) else None
++            if isinstance(fn, dict) and "arguments" in fn and not isinstance(args, dict):
++                parsed = args
++                if isinstance(args, str):
++                    try:
++                        parsed = json.loads(args)
++                    except (ValueError, TypeError):
++                        parsed = None
++                if not isinstance(parsed, dict):
++                    parsed = {"_invalid_arguments": args}
++                call = {**call, "function": {**fn, "arguments": parsed}}
++                touched = True
++            new_calls.append(call)
++        if touched:
++            out.append({**message, "tool_calls": new_calls})
++            changed = True
++        else:
++            out.append(message)
++    return out if changed else messages
 diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
-index 9c636df..07b2872 100644
+index a46d806..f098699 100644
 --- tensorfold/server/prompts.py
 +++ tensorfold/server/prompts.py
-@@ -22,6 +22,29 @@ def has_images(messages):
+@@ -23,6 +23,29 @@ def has_images(messages):
                 for m in messages or [])
  
  
@@ -116,7 +245,7 @@ index 9c636df..07b2872 100644
  IMAGE_SLOTS = threading.BoundedSemaphore(16)      # requests decoding and processing images at once (host memory)
  IMAGE_WAITERS = threading.BoundedSemaphore(128)   # requests waiting for a slot; past that, refused at once
  IMAGE_WAIT_S = 60.0
-@@ -39,6 +62,42 @@ def image_slot():
+@@ -40,6 +63,44 @@ def image_slot():
      return IMAGE_SLOTS
  
  
@@ -156,10 +285,12 @@ index 9c636df..07b2872 100644
 +        return self.pattern.sub("", text), order
 +
 +
- def prepare_images(frontend, messages, render, *, context_limit=None):
-     from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
++def prepare_images(frontend, messages, render, *, context_limit=None):
++    from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
+ def prepare_images(frontend, messages, render, *, context_limit=None, limits: ImageLimits = DEFAULT_LIMITS):
+     from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, ImageSource, load_images, split_images
  
-@@ -48,9 +107,16 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+@@ -49,9 +110,16 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
      videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
      # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
      limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
@@ -177,20 +308,16 @@ index 9c636df..07b2872 100644
      except (ImageInputError, ValueError) as exc:
          raise RequestError(str(exc)) from exc
      slot = image_slot()
-@@ -70,9 +136,11 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+@@ -71,7 +139,8 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
                  from tensorfold.vision.videos import load_videos
  
-                 clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
--            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
-+            prepared = frontend.prepare(text if text is not None else render(template), images, videos=clips,
-+                                        max_prompt_tokens=context_limit)
-         else:
--            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
-+            prepared = frontend.prepare(text if text is not None else render(template), images,
-+                                        max_prompt_tokens=context_limit)
+                 budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+-        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
++        prepared = frontend.prepare(text if text is not None else render(template), images,
++                                    max_prompt_tokens=context_limit, **budget)
      except (ImageInputError, ValueError, ImportError) as exc:
-         raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
-     finally:
+         raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded
+ 
 diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
 index d53889d..16c11e8 100644
 --- tensorfold/vision/glm.py
@@ -204,25 +331,25 @@ index d53889d..16c11e8 100644
      def __init__(self, model_dir: Path, device, *, allow_urls: bool = False,
                   limits: GlmVisionLimits | None = None) -> None:
 diff --git tensorfold/vision/images.py tensorfold/vision/images.py
-index c90a79b..1f5734d 100644
+index 728e5e6..73c8a4b 100644
 --- tensorfold/vision/images.py
 +++ tensorfold/vision/images.py
-@@ -114,11 +114,12 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+@@ -122,11 +122,12 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
  
  
  def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
 -                 allow_videos: bool = False, max_videos: int | None = None
 +                 allow_videos: bool = False, max_videos: int | None = None, tool_media: bool = False
                   ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
-     """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
-     ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
+     """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
+     also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
 -    (default: the shared video limits')."""
 +    (default: the shared video limits'); ``tool_media``: tool results' parts too (a frontend whose template renders
 +    them in place)."""
      if not isinstance(messages, list) or not messages:
          raise ImageInputError("messages must be a non-empty list")
      output, sources = [], []
-@@ -148,7 +149,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+@@ -156,7 +157,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
              elif kind == "video_url" and allow_videos:
                  from .videos import DEFAULT_VIDEO_LIMITS, video_source
  
@@ -231,12 +358,31 @@ index c90a79b..1f5734d 100644
                      raise ImageInputError("video_url parts are supported only in user messages")
                  if any(part.get(key) for key in _MEDIA - {"video_url"}):
                      raise ImageInputError("video_url parts cannot contain other media")
-@@ -159,7 +160,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
-                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
-                 parts.append({"type": "video"})
-             elif kind == "image_url":
+diff --git tensorfold/vision/images.py.orig tensorfold/vision/images.py.orig
+index 728e5e6..73c8a4b 100644
+--- tensorfold/vision/images.py.orig
++++ tensorfold/vision/images.py.orig
+@@ -122,11 +122,12 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+ 
+ 
+ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
+-                 allow_videos: bool = False, max_videos: int | None = None
++                 allow_videos: bool = False, max_videos: int | None = None, tool_media: bool = False
+                  ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+     """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
+     also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
+-    (default: the shared video limits')."""
++    (default: the shared video limits'); ``tool_media``: tool results' parts too (a frontend whose template renders
++    them in place)."""
+     if not isinstance(messages, list) or not messages:
+         raise ImageInputError("messages must be a non-empty list")
+     output, sources = [], []
+@@ -156,7 +157,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+             elif kind == "video_url" and allow_videos:
+                 from .videos import DEFAULT_VIDEO_LIMITS, video_source
+ 
 -                if role != "user":
 +                if role != "user" and not (tool_media and role == "tool"):
-                     raise ImageInputError("image_url parts are supported only in user messages")
-                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
-                     raise ImageInputError("image_url parts cannot contain other media")
+                     raise ImageInputError("video_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"video_url"}):
+                     raise ImageInputError("video_url parts cannot contain other media")

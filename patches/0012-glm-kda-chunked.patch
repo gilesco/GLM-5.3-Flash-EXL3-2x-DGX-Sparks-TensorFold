@@ -1,8 +1,8 @@
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 98ed9e6..c1fb8ce 100644
+index 1af99f7..52b70c7 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -285,7 +285,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+@@ -287,7 +287,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
      with prof.timed("kda: recurrence"):
          out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
                              k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
@@ -11,6 +11,239 @@ index 98ed9e6..c1fb8ce 100644
      if pre:                              # a prompt chunk keeps every row: the layer commits now
          st.cur[li] = 1 - cur
          _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 615ba92..1af99f7 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -125,6 +125,8 @@ class Buffers:
+         self.tap_at: dict[int, list[int]] = {}
+         self.experts = c.experts
+         self.top_k = c.top_k
++        # TF_GLM_HC_SPLIT: a prompt buffer's row split (``hcsplit.HcSplit``), set by the engine; None runs unsplit
++        self.split = None
+ 
+     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
+         self.tap_at = {}
+@@ -246,9 +248,27 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+ 
+-def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor:
+-    mm(b, x, q, xs, b.part[:R], f32=True)
+-    return gather(w, b, R)
++def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) -> torch.Tensor | None:
++    """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
++    [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
++    and runs hc_post itself (``hcsplit.HcSplit``)."""
++
++    sp = b.split
++    if sp is not None and sp.active:
++        sp.partial(fill)
++        return None
++    fill(0, R)
++    if label is None:
++        return gather(w, b, R)
++    with prof.timed(label):
++        return gather(w, b, R)
++
++
++def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor | None:
++    def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
++        mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
++
++    return partials(w, b, R, fill)
+ 
+ 
+ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+@@ -316,12 +336,23 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
+ 
+ 
++def dense_rows(c, R: int, host_pos: int | None) -> int:
++    """Rows of a window from ``host_pos`` that keep dense attention: those before the first position select_tokens
++    gives a sparse count (sparse_attention overwrites every row from there). All R when the position is not known
++    on the host or the config's dense limit is not the selection's."""
++
++    if host_pos is None or c.dense_limit != sparse.SPARSE_FROM:
++        return R
++    return min(R, max(0, sparse.SPARSE_FROM - host_pos))
++
++
+ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s: latent.LatentScratch, *,
+-                    scale: float, nch: int, out: torch.Tensor) -> torch.Tensor:
+-    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row."""
++                    scale: float, nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
++    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row
++    (``hb``: the window's ``head_block``, which a window's first rows computed alone keep)."""
+ 
+     R, step = qa.shape[0], s.part_rows
+-    hb = latent.head_block(R)
++    hb = latent.head_block(R) if hb is None else hb
+     if R <= step:
+         return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
+     for r0 in range(0, R, step):
+@@ -355,16 +386,22 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+     ol = s.ol[:R]
+     scale = c.qk_dim ** -0.5
+     if not all_sparse:
+-        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
++        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
++        # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
++        dense = dense_rows(c, R, host_pos) if sparse_rows else R
+         with prof.timed("dsa: dense attention"):
+-            dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
++            dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
++                            hb=latent.head_block(R))
+     if sparse_rows:
+         with prof.timed("dsa: select tokens"):
+             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+             tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
+                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+-            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
++            if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
++                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
++            else:
++                latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
+@@ -391,23 +428,48 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ 
+             exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+         s = m.shared
+-        with prof.timed("moe: shared expert"):
+-            mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+-            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+-            mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+-        with prof.timed("moe: combine"):
+-            b.ey[:R, c.top_k].copy_(b.sy[:R])
+-            glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+-        with prof.timed("moe: all-gather"):
+-            return gather(w, b, R)
++
++        def fill(lo: int, hi: int) -> None:
++            with prof.timed("moe: shared expert"):
++                mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], b.sgu[lo:hi])
++                glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
++                mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
++            with prof.timed("moe: combine"):
++                if b.prefill:            # the shared row read from sy where it is (the copy's bits, one pass less)
++                    glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++                else:
++                    b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
++                    glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++
++        return partials(w, b, R, fill, "moe: all-gather")
+     with prof.timed("moe: gate/up"):
+         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
+     with prof.timed("moe: down"):
+         grouped.down(b.eact, m.experts, b.plan, b.ey.view(-1, c.hidden), R)
+-    with prof.timed("moe: combine"):
+-        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+-    with prof.timed("moe: all-gather"):
+-        return gather(w, b, R)
++
++    def fill(lo: int, hi: int) -> None:
++        with prof.timed("moe: combine"):
++            glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++
++    return partials(w, b, R, fill, "moe: all-gather")
++
++
++def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
++           sparse_np: int | None) -> torch.Tensor | None:
++    """The layer's KDA or DSA block on b.normed: every rank's partials, or None row-split (``partials``)."""
++
++    if layer.kind == "kda":
++        with prof.timed("kda"):
++            return kda_block(layer, w, st, b, R)
++    di = st.dsa_index[layer.index]
++    with prof.timed("dsa (total)"):
++        return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
++                         st.index[di] if st.index is not None else None, host_pos, sparse_np)
++
++
++def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
++    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
++        return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+@@ -417,24 +479,43 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     h = layer.attn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+-    if layer.kind == "kda":
+-        with prof.timed("kda"):
+-            g = kda_block(layer, w, st, b, R)
+-    else:
+-        di = st.dsa_index[layer.index]
+-        with prof.timed("dsa (total)"):
+-            g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
+-                          st.index[di] if st.index is not None else None, host_pos, sparse_np)
++    g = _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
+     with prof.timed("hc"):
+         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+-    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+-        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
++    g = _ffn(layer, w, b, R)
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+ 
+ 
++def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None) -> None:
++    """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
++    (``hcsplit``): the first hc_pre runs on every row as unsplit, each later one on this rank's rows, and b.normed,
++    the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean."""
++
++    c = w.cfg
++    sp = b.split
++    layers = w.layers
++    sp.begin(R)
++    try:
++        Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
++        first, h = layers[0], layers[0].attn_hc
++        glue.hc_pre(b.x[:Rp], h.fn, h.base, h.scale, first.in_norm, b.normed[:Rp], b.xs[:Rp], b.post[:Rp],
++                    b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
++        for i, layer in enumerate(layers):
++            _mixer(layer, w, st, b, R, nch, host_pos, None)
++            with prof.timed("hc"):
++                sp.glue(layer.ffn_hc, layer.post_norm)
++            _ffn(layer, w, b, R)
++            nxt = layers[i + 1] if i + 1 < len(layers) else None
++            with prof.timed("hc (layer end)"):
++                sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
++                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None)
++    finally:
++        sp.finish()
++
++
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+     pos = st.pos if pos is None else pos
+     if pos + R > w.cfg.dense_limit and st.index is None:
+@@ -467,11 +548,14 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+-    for layer in w.layers:
+-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+-        for slot in b.tap_at.get(layer.index, ()):
+-            glue.stream_mean(b.x[:R], b.taps[slot][:R])
+-    glue.stream_mean(b.x[:R], b.hidden[:R])
++    if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
++        split_layers(w, st, b, R, nch, host_pos)             # also leaves the taps and b.hidden[:R]
++    else:
++        for layer in w.layers:
++            layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
++            for slot in b.tap_at.get(layer.index, ()):
++                glue.stream_mean(b.x[:R], b.taps[slot][:R])
++        glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
 diff --git tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
 index b4a8a60..9975ab1 100644
 --- tensorfold/families/glm5_next/cuda/kda.py

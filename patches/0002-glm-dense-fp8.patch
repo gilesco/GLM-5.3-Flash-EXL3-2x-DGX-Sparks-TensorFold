@@ -1,5 +1,5 @@
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index b98d846..b29529c 100644
+index e6c4d2a..220a36a 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -136,9 +136,14 @@ class GlmEngine:
@@ -19,10 +19,10 @@ index b98d846..b29529c 100644
              weights_estimate = without_mtp(weights_estimate, cfg.layers)
          self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 01a173c..f73f253 100644
+index f073b6e..56a10f4 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -260,29 +260,32 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
+@@ -262,29 +262,32 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
      k = layer.kda
      li = st.kda_index[layer.index]
      p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
@@ -73,12 +73,19 @@ index 01a173c..f73f253 100644
  
  
  def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
-@@ -398,14 +401,18 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+@@ -395,18 +398,23 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     with prof.timed("moe: route"):
+         glue.router(b.normed[:R], m.router, b.mlog[:R])
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+-        if m.shared is None:
+-            grouped.route(b.pick[:R], b.plan)
++        grouped.route(b.pick[:R], b.plan)
+     if m.shared is not None:
          # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-         from . import exl3_mm
- 
--        exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+-        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
 +        with prof.timed("moe: routed (exl3)"):
++            from . import exl3_mm
++
 +            exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
          s = m.shared
 -        mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
@@ -260,19 +267,19 @@ index a366806..827db2b 100644
 +        return total, extra
 +    return transform
 diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
-index 48c4190..fd9db9d 100644
+index 5f81a7b..f551104 100644
 --- tensorfold/families/glm5_next/cuda/weights.py
 +++ tensorfold/families/glm5_next/cuda/weights.py
 @@ -13,7 +13,7 @@ from tensorfold.cuda import experts as grouped
  
- from .exl3_mm import Exl3Experts, words as exl3_words
+ from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
  from . import latent
 -from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
 +from .qmm import B16, F8, Q4, as_i32, dense_kind, make_b16, make_f8, make_q4, quantize4, stack_b16, stack_f8, stack_q4
  
  PREFIX = "model.language_model."
  
-@@ -204,7 +204,7 @@ class Weights:
+@@ -214,7 +214,7 @@ class Weights:
      embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
      layers: list[LayerW]
      norm: torch.Tensor
@@ -281,7 +288,7 @@ index 48c4190..fd9db9d 100644
      mtp: MTPW | None
      rank: int
      world: int
-@@ -226,7 +226,7 @@ class Weights:
+@@ -236,7 +236,7 @@ class Weights:
              if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                  seen.add(t.data_ptr())
                  total += t.numel() * t.element_size()
@@ -290,7 +297,7 @@ index 48c4190..fd9db9d 100644
                  for v in vars(t).values():
                      add(v)
              elif isinstance(t, (list, tuple)):
-@@ -269,12 +269,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -279,12 +279,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
      def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
          return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
  
@@ -311,7 +318,7 @@ index 48c4190..fd9db9d 100644
          return stack_q4([trip(n) for n in names])
  
      def hc(i: int, site: str) -> HCW:
-@@ -295,7 +299,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -305,7 +309,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
          krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
          if exl3:
              w = t(p + "kv_b_proj.weight")
@@ -320,7 +327,7 @@ index 48c4190..fd9db9d 100644
              full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
          else:
              w, s, b = trip(p + "kv_b_proj")
-@@ -417,9 +421,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -428,9 +432,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
          vl = cfg.vocab // world
          draft_head = None
          if exl3:

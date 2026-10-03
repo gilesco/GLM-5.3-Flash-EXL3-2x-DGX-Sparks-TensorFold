@@ -373,10 +373,10 @@ index 71cd600..5e21f90 100644
      if plan.tile != grouped.TILE:
          raise ValueError("the EXL3 kernel takes items of 16 pairs")
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index a5a4180..a961a94 100644
+index 615ba92..2ff7b6d 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -314,12 +314,23 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+@@ -316,12 +316,23 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
      return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
  
  
@@ -403,7 +403,7 @@ index a5a4180..a961a94 100644
      if R <= step:
          return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
      for r0 in range(0, R, step):
-@@ -353,16 +364,22 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -355,16 +366,22 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
      ol = s.ol[:R]
      scale = c.qk_dim ** -0.5
      if not all_sparse:
@@ -429,7 +429,7 @@ index a5a4180..a961a94 100644
      with prof.timed("dsa: expand"):
          o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
-@@ -394,8 +411,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+@@ -396,8 +413,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
              glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
              mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
          with prof.timed("moe: combine"):
@@ -443,6 +443,112 @@ index a5a4180..a961a94 100644
          with prof.timed("moe: all-gather"):
              return gather(w, b, R)
      with prof.timed("moe: gate/up"):
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index d802840..615ba92 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -2,7 +2,6 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
+ from typing import Sequence
+ from types import SimpleNamespace
+ 
+@@ -20,15 +19,6 @@ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+ 
+-@dataclass
+-class Cut:
+-    """The recurrent state and convolution windows at an interior prompt row."""
+-
+-    point: int
+-    rec: torch.Tensor
+-    conv: torch.Tensor
+-
+-
+ class Buffers:
+     """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
+ 
+@@ -261,7 +251,7 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
+     return gather(w, b, R)
+ 
+ 
+-def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut | None = None) -> torch.Tensor:
++def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+     c = w.cfg
+     k = layer.kda
+     li = st.kda_index[layer.index]
+@@ -275,18 +265,9 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
+         mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+     cur = st.cur[li]
+     with prof.timed("kda: recurrence"):
+-        if cut is None:
+-            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                                k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
+-                                st.rec[1 - cur, li])
+-        else:
+-            n = cut.point
+-            first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
+-                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
+-            _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+-            rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
+-                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
+-            out = torch.cat((first, rest))
++        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                            k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
++                            st.rec[1 - cur, li])
+     if pre:                              # a prompt chunk keeps every row: the layer commits now
+         st.cur[li] = 1 - cur
+         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+@@ -430,7 +411,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+-                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None) -> None:
++                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
+     c = w.cfg
+     x = b.x[:R]
+     h = layer.attn_hc
+@@ -438,7 +419,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+     if layer.kind == "kda":
+         with prof.timed("kda"):
+-            g = kda_block(layer, w, st, b, R, cut)
++            g = kda_block(layer, w, st, b, R)
+     else:
+         di = st.dsa_index[layer.index]
+         with prof.timed("dsa (total)"):
+@@ -478,24 +459,24 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None, inject=None):
++            host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True):
+     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
+ 
+-    if cut is not None and (not b.prefill or not 0 < cut.point < R):
+-        raise ValueError("a prompt cut must lie inside a prefill chunk")
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+     for layer in w.layers:
+-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
++        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+         for slot in b.tap_at.get(layer.index, ()):
+             glue.stream_mean(b.x[:R], b.taps[slot][:R])
+     glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if not head:                         # the normed rows (MTP, last_hidden) without the head: None
++        return None
+     if b.prefill:                        # the head reads the last row only (fnormed keeps every row for the MTP)
+         return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
+     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
 diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
 index 84f0dbe..dbde3f1 100644
 --- tensorfold/families/glm5_next/cuda/glue.py

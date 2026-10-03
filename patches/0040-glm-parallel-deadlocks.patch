@@ -39,7 +39,7 @@ index 52bc376..bba421c 100644
              self.large += 1
              self.nccl.all_gather(send, recv)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index ae6a079..2e0d675 100644
+index c27eecf..2a881d6 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -553,7 +553,7 @@ class GlmEngine:

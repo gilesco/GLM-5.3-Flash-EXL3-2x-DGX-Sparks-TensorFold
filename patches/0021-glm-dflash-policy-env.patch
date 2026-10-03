@@ -1,5 +1,5 @@
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index b626ecf..e37584a 100644
+index 3c14034..e52e118 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -12,7 +12,9 @@ from pathlib import Path

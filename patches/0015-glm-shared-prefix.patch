@@ -64,7 +64,7 @@ index cd9a9f1..79a6427 100644
  
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 76602c5..c4b826e 100644
+index 816d899..2a05621 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -72,6 +72,84 @@ def grid_point(n: int, cut: int, grid: int) -> int | None:
@@ -354,7 +354,7 @@ index 76602c5..c4b826e 100644
          stats.update(policy=spec, drafts=draft)
          if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
              self.comm.check()
-@@ -724,33 +850,39 @@ class GlmEngine:
+@@ -765,8 +891,15 @@ class GlmEngine:
      def follow(self) -> None:
          """Rank 1: mirror every request rank 0 serves, forever."""
  
@@ -366,56 +366,26 @@ index 76602c5..c4b826e 100644
 +
          from tensorfold.engine.exact_sampling import Sampling
  
--        while True:
--            self._await_bell()
--            (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
--             images, *code) = self._share(None)
--            prompt = self._share(None)
--            packed = self._share(None) if shaped else []
--            constraint = None
--            if packed:                                  # compiled here as on rank 0
--                from tensorfold.engine import grammar
--
--                constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
--            feed = VisionFeed(self, self._share(None), None) if images else None
--            temperature = _ints_f64(t_lo, t_hi)
--            seed = (s_top << 62) | (s_hi << 31) | s_lo
--            sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
--                        if temperature > 0 else None)
--            hit = None
--            if cached:
--                hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
--                if hit is None:
--                    raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
--            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
--                      constraint, feed)
--            if hasattr(self.comm, "check"):
--                self.comm.check()
-+        self._await_bell()
-+        (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
-+         images, *rest) = self._share(None)
-+        shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
-+        prompt = self._share(None)
-+        packed = self._share(None) if shaped else []
-+        constraint = None
-+        if packed:                                  # compiled here as on rank 0
-+            from tensorfold.engine import grammar
 +
-+            constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
-+        feed = VisionFeed(self, self._share(None), None) if images else None
-+        temperature = _ints_f64(t_lo, t_hi)
-+        seed = (s_top << 62) | (s_hi << 31) | s_lo
-+        sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
-+                    if temperature > 0 else None)
-+        hit = None
-+        if cached:
-+            hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
-+            if hit is None:
-+                raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
-+        self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
-+                  constraint, feed, shared)
-+        if hasattr(self.comm, "check"):
-+            self.comm.check()
+         while True:
+             self._await_bell()
+             header = self._share(None)
+@@ -776,7 +909,8 @@ class GlmEngine:
+                 self._score_local(prompt, labels)
+                 continue
+             (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
+-              images, *code) = header
++              images, *rest) = header
++            shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
+             prompt = self._share(None)
+             packed = self._share(None) if shaped else []
+             constraint = None
+@@ -795,7 +929,7 @@ class GlmEngine:
+                 if hit is None:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                      constraint, feed)
++                      constraint, feed, shared)
+             if hasattr(self.comm, "check"):
+                 self.comm.check()
  
- 
- class VisionFeed:

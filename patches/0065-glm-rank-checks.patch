@@ -1,6 +1,3 @@
-# Rank messages sealed with a sequence number and a checksum (a desync is a named error), TF_GLM_MULTI_WATCHDOG_EXIT=1
-# (a stalled server exits after its stack dump), /health iteration_s (issue #29 diagnostics). MiaAI-Lab, Apache-2.0.
-
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
 index 840d182..4c7f64e 100644
 --- tensorfold/families/glm5_next/cuda/multi.py

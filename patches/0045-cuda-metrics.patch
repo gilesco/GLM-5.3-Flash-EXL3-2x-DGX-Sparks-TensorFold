@@ -1,9 +1,9 @@
 diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
-index 4dda35a..c210a65 100644
+index e0d2be2..8e1abb2 100644
 --- tensorfold/server/metrics.py
 +++ tensorfold/server/metrics.py
-@@ -7,10 +7,12 @@ import time
- from typing import Any
+@@ -15,10 +15,12 @@ from typing import Any
+ from tensorfold.server.memory_budget import process_footprint
  
  PREFIX = "tensorfold:"
 +HEALTH = "tensorfold_health:"      # the CUDA server's /health fields, named as /health names them
@@ -15,33 +15,34 @@ index 4dda35a..c210a65 100644
  
  
  class Histogram:
-@@ -135,7 +137,7 @@ def render(app: Any) -> str:
+@@ -149,8 +151,8 @@ def render(app: Any) -> str:
          prompt, generation = metrics.prompt, metrics.generation
          drafted, accepted = metrics.drafted, metrics.accepted
-         latency, ttft = metrics.latency.copy(), metrics.ttft.copy()
+         latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
 -    running, waiting = _requests(app)
+-    pools = _pools(app)
 +    running, waiting = _read(lambda: _requests(app), (0, 0))
++    pools = _read(lambda: _pools(app), [])
      lines: list[str] = []
      _family(lines, "requests_running", "gauge", "Requests in prefill or decode.",
              [f"{PREFIX}requests_running {running}"])
-@@ -147,13 +149,15 @@ def render(app: Any) -> str:
-             [f"{PREFIX}generation_tokens_total {generation}"])
+@@ -163,6 +165,7 @@ def render(app: Any) -> str:
      _family(lines, "kv_cache_usage_ratio", "gauge",
              "Tokens in a stream cache divided by that stream's context window.",
--            [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in _pools(app)])
-+            [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}'
-+             for pool, ratio in _read(lambda: _pools(app), [("0", 0.0)])])
+             [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in pools])
++
      _family(lines, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.",
              [f"{PREFIX}mtp_drafted_total {drafted}"])
      _family(lines, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.",
-             [f"{PREFIX}mtp_accepted_total {accepted}"])
-     _histogram(lines, "request_latency_seconds", "Seconds from arrival to the reply leaving.", latency)
-     _histogram(lines, "time_to_first_token_seconds", "Seconds from arrival to the first generated token.", ttft)
+@@ -207,6 +210,7 @@ def render(app: Any) -> str:
+     if preempted is not None:
+         _family(lines, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.",
+                 [f"{PREFIX}preemptions_total {preempted}"])
 +    _health(lines, app)
      return "\n".join(lines) + "\n"
  
  
-@@ -161,18 +165,75 @@ def send(handler: Any, app: Any) -> None:
+@@ -214,18 +218,75 @@ def send(handler: Any, app: Any) -> None:
      """Write ``render`` as Prometheus text, version 0.0.4."""
  
      body = render(app).encode()
@@ -123,7 +124,7 @@ index 4dda35a..c210a65 100644
      lines.append(f"# HELP {full} {help_text}")
      lines.append(f"# TYPE {full} {kind}")
      lines.extend(samples)
-@@ -235,7 +296,9 @@ def _pools(app: Any) -> list[tuple[str, float]]:
+@@ -313,7 +374,9 @@ def _pools(app: Any) -> list[tuple[str, float]]:
  def _window(app: Any) -> int:
      engine = getattr(app, "engine", None)
      decoder = getattr(getattr(engine, "scheduler", None), "decoder", None) if engine is not None else None
@@ -134,7 +135,7 @@ index 4dda35a..c210a65 100644
          n = _positive(getattr(owner, name, None) if owner is not None else None)
          if n:
              return n
-@@ -256,16 +319,14 @@ def _lengths(app: Any) -> list[int]:
+@@ -334,16 +397,14 @@ def _lengths(app: Any) -> list[int]:
  
  
  def _occupied(stream: Any) -> int:
@@ -155,7 +156,7 @@ index 4dda35a..c210a65 100644
  
  
  def _positive(value: Any) -> int:
-@@ -286,5 +347,5 @@ def _edge(value: float) -> str:
+@@ -364,5 +425,5 @@ def _edge(value: float) -> str:
      return f"{value:.4f}".rstrip("0").rstrip(".")
  
  

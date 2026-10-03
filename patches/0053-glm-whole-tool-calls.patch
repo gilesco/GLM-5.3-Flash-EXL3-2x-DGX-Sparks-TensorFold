@@ -46,12 +46,12 @@ index 2f63be4..1ad8ca7 100644
          while True:
              rest = text[self.pos:]
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index 673fc9f..762cd3d 100644
+index fef64e8..04cb9f0 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -29,6 +29,10 @@ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopSt
- from tensorfold.cuda.turns import Turns, Yield
+@@ -32,6 +32,10 @@ from tensorfold.cuda.turns import Turns, Yield
  from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
  
 +# While a GLM tool call is written it is held until whole (a call the reply ends inside is never sent); an idle client
 +# (upstream #114: one that drops a reply sending nothing) gets an empty delta this often meanwhile
@@ -60,7 +60,7 @@ index 673fc9f..762cd3d 100644
  
  # -- requests --------------------------------------------------------------------------------
  
-@@ -363,6 +367,7 @@ class App:
+@@ -417,6 +421,7 @@ class App:
          # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
          glm_calls = bool(tools) and self._glm_calls()
          calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
@@ -68,7 +68,7 @@ index 673fc9f..762cd3d 100644
          # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
          # end parser
          xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
-@@ -424,6 +429,11 @@ class App:
+@@ -478,6 +483,11 @@ class App:
                  parts = [delta] if delta else []
                  if calls_stream is not None:
                      parts += calls_stream.feed(call_text(raw))
@@ -80,7 +80,7 @@ index 673fc9f..762cd3d 100644
                  if not all(emit(part) for part in parts):
                      stopped["client"] = True
                  if xml_stream is not None and not stopped["client"]:
-@@ -525,11 +535,13 @@ class App:
+@@ -580,11 +590,13 @@ class App:
          # (never streamed) are the end parser's, sent whole
          if calls_stream is not None and (think is None or think.stream_from is not None):
              call_deltas = calls_stream.feed(call_text(raw))
@@ -98,3 +98,21 @@ index 673fc9f..762cd3d 100644
          tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
          if tail:
              final["content"] = tail
+diff --git tensorfold/cuda/server.py.orig tensorfold/cuda/server.py.orig
+index d597ffa..fef64e8 100644
+--- tensorfold/cuda/server.py.orig
++++ tensorfold/cuda/server.py.orig
+@@ -668,6 +668,13 @@ def _flag(body: dict[str, Any], name: str, default: bool) -> bool:
+     return value
+ 
+ 
++def _flag(body: dict[str, Any], name: str, default: bool) -> bool:
++    value = body.get(name, default)
++    if not isinstance(value, bool):
++        raise RequestError(f"{name} must be a boolean")
++    return value
++
++
+ def token_sha(tokens: list[int]) -> str:
+     """A reply's token ids, hashed as the Mac server does: drafted and ``"draft": false`` replies must match."""
+ 

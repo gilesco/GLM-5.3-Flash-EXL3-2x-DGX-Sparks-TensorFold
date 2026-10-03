@@ -104,7 +104,7 @@ index 2382093..a117edc 100644
          e.window = e.constraint.window([0], [-1])
      first = e.sample(last, [len(prompt)], sampling)[0]
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 2e0d675..032b546 100644
+index 2a881d6..cd22f0c 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -827,14 +827,16 @@ class GlmEngine:

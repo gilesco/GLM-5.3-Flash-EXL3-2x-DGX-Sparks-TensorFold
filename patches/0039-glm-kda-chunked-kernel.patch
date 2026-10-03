@@ -1,5 +1,5 @@
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 2524b65..ae6a079 100644
+index b4db9a4..c27eecf 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -84,19 +84,34 @@ def vision_workspace() -> int:

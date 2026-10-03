@@ -38,10 +38,10 @@ index 54fd7ee..9e0fdb6 100644
          self.items = torch.zeros((max_items(pairs, experts, TILE), 3), dtype=torch.int32, device=device)
          self.counts = torch.zeros((2,), dtype=torch.int32, device=device)
 diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
-index 44d7994..9a1b8d5 100644
+index 0f9dae5..7f8b46f 100644
 --- tensorfold/cuda/geometry.py
 +++ tensorfold/cuda/geometry.py
-@@ -227,7 +227,7 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
+@@ -252,7 +252,7 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
  
  
  def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
@@ -50,7 +50,7 @@ index 44d7994..9a1b8d5 100644
      """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
      linear, attention = layer_counts(t)
      lin = t.get("linear_attn_config") or {}
-@@ -249,21 +249,21 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+@@ -274,21 +274,21 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
      extent += int(t.get("intermediate_size", width)) * 3 // world + int(t.get("index_n_heads", 32)) * index
      fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
      # prompt-chunk buffers: at most 5 row extents a row without the head
@@ -78,7 +78,7 @@ index 44d7994..9a1b8d5 100644
          else:
              cache = count * capacity * heads * (kd + vd) * 2
              scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
-@@ -272,14 +272,14 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+@@ -297,14 +297,14 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
      return Geometry(bytes_at, reserve, minimum_slots)
  
  
@@ -97,7 +97,7 @@ index 44d7994..9a1b8d5 100644
      return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 47d2a02..1c11a54 100644
+index 84be913..111339d 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -20,10 +20,10 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
@@ -147,7 +147,7 @@ index 47d2a02..1c11a54 100644
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                  prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
-@@ -553,7 +560,11 @@ class GlmEngine:
+@@ -555,7 +562,11 @@ class GlmEngine:
              if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
                  raise ValueError("image rows must sit at increasing positions inside the prompt")
              t = time.perf_counter()
@@ -741,23 +741,26 @@ index 58e739d..71cd600 100644
 +                w, nfirst, _pf(), nfirst and sk > 1 and _seq())
      ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, sk, slots)
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 225109f..0e130f5 100644
+index d69d001..d802840 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -98,17 +98,21 @@ class Buffers:
+@@ -99,18 +99,22 @@ class Buffers:
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
          self.eact = torch.empty((rows * slots, ml), dtype=bf, device=dev)
          exl3 = c.quant == "exl3"
-         self.ey = torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32, device=dev)
--        self.plan = grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill and not exl3)
+-        self.ey = None if exl3 else torch.empty((rows, slots, D), dtype=bf if prefill else f32, device=dev)
+-        self.plan = None if exl3 else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill)
++        self.ey = torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32, device=dev)
          self.exl3 = None
 +        prompt = False
          if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
--            from .exl3_mm import Scratch
 +            from .exl3_mm import Scratch, prompt_kernels, prompt_pass
- 
++
 +            prompt = prefill and prompt_kernels()
              sl = c.shared_width // w.world
--            self.exl3 = Scratch(rows, slots, D, ml, dev)
+-            shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
+-            self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
+-            self.ey = self.exl3.y.view(rows, slots, D)
 +            self.exl3 = Scratch(rows, slots, D, ml, dev, prompt=prompt)
              self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
              self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
@@ -769,7 +772,7 @@ index 225109f..0e130f5 100644
          # rank partials
          self.part = torch.empty((rows, D), dtype=f32, device=dev)
          self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
-@@ -364,7 +368,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -366,7 +370,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
              glue.router(b.normed[:R], ix.gate, b.igr[:R])
              sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
      with prof.timed("dsa: absorb"):
@@ -778,7 +781,7 @@ index 225109f..0e130f5 100644
      ol = s.ol[:R]
      scale = c.qk_dim ** -0.5
      if not all_sparse:
-@@ -379,7 +383,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -381,7 +385,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
          with prof.timed("dsa: sparse attention"):
              latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
      with prof.timed("dsa: expand"):
@@ -787,7 +790,7 @@ index 225109f..0e130f5 100644
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
  
  
-@@ -396,7 +400,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+@@ -398,7 +402,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
      with prof.timed("moe: route"):
          glue.router(b.normed[:R], m.router, b.mlog[:R])
          glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
@@ -795,8 +798,8 @@ index 225109f..0e130f5 100644
 +        grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
      if m.shared is not None:
          # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-         from . import exl3_mm
-@@ -429,7 +433,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+         with prof.timed("moe: routed (exl3)"):
+@@ -431,7 +435,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
      x = b.x[:R]
      h = layer.attn_hc
      glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
@@ -805,7 +808,7 @@ index 225109f..0e130f5 100644
      if layer.kind == "kda":
          with prof.timed("kda"):
              g = kda_block(layer, w, st, b, R, cut)
-@@ -442,7 +446,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+@@ -444,7 +448,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
          glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
          h = layer.ffn_hc
          glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],

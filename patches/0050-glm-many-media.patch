@@ -1,29 +1,39 @@
 diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
-index dabd045..bebd06f 100644
+index ec16d4f..da7a0c1 100644
 --- tensorfold/cuda/http.py
 +++ tensorfold/cuda/http.py
-@@ -93,9 +93,9 @@ def make_handler(app: App):
+@@ -119,7 +119,7 @@ def make_handler(app: App):
+ 
                  return self._json(404, {"error": "not found"})
              try:
-                 length = int(self.headers.get("Content-Length", 0))
--                if not 0 <= length <= 32 * 1024**2:
-+                if not 0 <= length <= 96 * 1024**2:          # up to 50 pictures or 4 clips as data URLs
-                     self.close_connection = True             # the unread body must not reach the next request
--                    return self._json(400, {"error": {"message": "request body exceeds the 32 MiB limit",
-+                    return self._json(400, {"error": {"message": "request body exceeds the 96 MiB limit",
-                                                       "type": "invalid_request_error"}})
-                 body = json.loads(self.rfile.read(length) or b"{}")
+-                body = json.loads(read_body(self) or b"{}")
++                body = json.loads(read_body(self, limit=96 * 1024**2) or b"{}")   # 50 pictures or 4 clips
+             except RequestError as exc:
+                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+             except (json.JSONDecodeError, UnicodeDecodeError):
+diff --git tensorfold/cuda/http.py.orig tensorfold/cuda/http.py.orig
+index ec16d4f..da7a0c1 100644
+--- tensorfold/cuda/http.py.orig
++++ tensorfold/cuda/http.py.orig
+@@ -119,7 +119,7 @@ def make_handler(app: App):
+ 
+                 return self._json(404, {"error": "not found"})
+             try:
+-                body = json.loads(read_body(self) or b"{}")
++                body = json.loads(read_body(self, limit=96 * 1024**2) or b"{}")   # 50 pictures or 4 clips
+             except RequestError as exc:
+                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
              except (json.JSONDecodeError, UnicodeDecodeError):
 diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
-index 2b9c05b..9c636df 100644
+index 1e5ea7c..a46d806 100644
 --- tensorfold/server/prompts.py
 +++ tensorfold/server/prompts.py
-@@ -40,21 +40,28 @@ def image_slot():
+@@ -41,21 +41,28 @@ def image_slot():
  
  
- def prepare_images(frontend, messages, render, *, context_limit=None):
--    from tensorfold.vision.images import ImageInputError, load_images, split_images
-+    from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
+ def prepare_images(frontend, messages, render, *, context_limit=None, limits: ImageLimits = DEFAULT_LIMITS):
+-    from tensorfold.vision.images import ImageInputError, ImageSource, load_images, split_images
++    from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, ImageSource, load_images, split_images
  
      if frontend is None:
          raise RequestError('image input requires a supported vision checkpoint served with --vision')
@@ -32,17 +42,17 @@ index 2b9c05b..9c636df 100644
 +    # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
 +    limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
      try:
--        template, sources = split_images(messages, allow_urls=allow_urls, allow_videos=videos)
+-        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos)
 +        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
 +                                         max_videos=getattr(frontend, 'max_videos', None))
      except (ImageInputError, ValueError) as exc:
          raise RequestError(str(exc)) from exc
      slot = image_slot()
      try:
-         from tensorfold.vision.images import ImageSource
- 
--        images = load_images([s for s in sources if isinstance(s, ImageSource)], allow_urls=allow_urls)
+-        images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=limits, allow_urls=allow_urls)
 +        pictures = [s for s in sources if isinstance(s, ImageSource)]
+         budget = {} if limits.max_visual_tokens == DEFAULT_LIMITS.max_visual_tokens else \
+             {"max_visual_tokens": limits.max_visual_tokens}
 +        if hasattr(frontend, 'load_images'):              # a frontend that fits each picture as it decodes it
 +            images = frontend.load_images(pictures)
 +        else:
@@ -50,6 +60,120 @@ index 2b9c05b..9c636df 100644
          clips = [s for s in sources if not isinstance(s, ImageSource)]
          if clips:
              if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
+diff --git tensorfold/server/prompts.py.orig tensorfold/server/prompts.py.orig
+new file mode 100644
+index 0000000..a46d806
+--- /dev/null
++++ tensorfold/server/prompts.py.orig
+@@ -0,0 +1,108 @@
++"""Prepare bounded text or image prompts before queueing GPU work."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++import threading
++from typing import Any
++
++from tensorfold.server.errors import CapacityError, RequestError, refusal
++from tensorfold.server.messages import _normalize_tool_call_arguments, normalize_messages
++from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
++
++
++@dataclass
++class RenderedPrompt:
++    tokens: list[int]
++    history_len: int = 0
++    vision: Any = None
++
++
++def has_images(messages):
++    return any(isinstance(m, dict) and isinstance(m.get('content'), list)
++               and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
++               for m in messages or [])
++
++
++IMAGE_SLOTS = threading.BoundedSemaphore(16)      # requests decoding and processing images at once (host memory)
++IMAGE_WAITERS = threading.BoundedSemaphore(128)   # requests waiting for a slot; past that, refused at once
++IMAGE_WAIT_S = 60.0
++
++
++def image_slot():
++    """Hold one image-preparation slot, or refuse with 503 when the queue is full or the wait runs out."""
++    if not IMAGE_WAITERS.acquire(blocking=False):
++        raise CapacityError('image request queue is full; retry shortly')
++    try:
++        if not IMAGE_SLOTS.acquire(timeout=IMAGE_WAIT_S):
++            raise CapacityError('image processing capacity is busy; retry shortly')
++    finally:
++        IMAGE_WAITERS.release()
++    return IMAGE_SLOTS
++
++
++def prepare_images(frontend, messages, render, *, context_limit=None, limits: ImageLimits = DEFAULT_LIMITS):
++    from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, ImageSource, load_images, split_images
++
++    if frontend is None:
++        raise RequestError('image input requires a supported vision checkpoint served with --vision')
++    allow_urls = bool(getattr(frontend, 'allow_urls', False))
++    videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
++    # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
++    limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
++    try:
++        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
++                                         max_videos=getattr(frontend, 'max_videos', None))
++    except (ImageInputError, ValueError) as exc:
++        raise RequestError(str(exc)) from exc
++    slot = image_slot()
++    try:
++        pictures = [s for s in sources if isinstance(s, ImageSource)]
++        budget = {} if limits.max_visual_tokens == DEFAULT_LIMITS.max_visual_tokens else \
++            {"max_visual_tokens": limits.max_visual_tokens}
++        if hasattr(frontend, 'load_images'):              # a frontend that fits each picture as it decodes it
++            images = frontend.load_images(pictures)
++        else:
++            images = load_images(pictures, limits=limits, allow_urls=allow_urls)
++        clips = [s for s in sources if not isinstance(s, ImageSource)]
++        if clips:
++            if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
++                budget["videos"] = frontend.load_videos(clips)
++            else:
++                from tensorfold.vision.videos import load_videos
++
++                budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
++        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
++    except (ImageInputError, ValueError, ImportError) as exc:
++        raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded
++
++    finally:
++        slot.release()
++    return RenderedPrompt(list(prepared.token_ids), vision=prepared)
++
++
++def prepare_prompt(app, messages, tools, thinking, prompt, fields):
++    if prompt is not None:
++        if isinstance(prompt, str):
++            with app.tokenizer_lock:
++                tokens = [int(t) for t in app.tokenizer.encode(prompt)]
++        else:
++            tokens = [int(t) for t in prompt]
++        return RenderedPrompt(tokens)
++    if not has_images(messages):
++        tokens, history = app.render(messages, tools, thinking=thinking)
++        return RenderedPrompt(tokens, history)
++    messages = _normalize_tool_call_arguments(normalize_messages(messages, late_system=app.late_system,
++                                                                 allow_images=True))
++    effort = app.effort_for(fields.get('reasoning_effort'))
++
++    def render(template):
++        kwargs = dict(add_generation_prompt=True, tokenize=False, enable_thinking=thinking)
++        if tools:
++            kwargs['tools'] = tools
++        if thinking and effort:
++            kwargs['reasoning_effort'] = effort
++        with app.tokenizer_lock:
++            return app.tokenizer.apply_chat_template(template, **kwargs)
++
++    return prepare_images(getattr(app, 'vision', None), messages, render, context_limit=app.context_window or None,
++                          limits=getattr(app, 'image_limits', DEFAULT_LIMITS))
 diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
 index 0cda666..08b7bac 100644
 --- tensorfold/vision/glm.py
@@ -242,24 +366,55 @@ index 0cda666..08b7bac 100644
                  pieces.append(rest[:i] + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
                  items.append(("image", picture))
 diff --git tensorfold/vision/images.py tensorfold/vision/images.py
-index e68c516..c90a79b 100644
+index 43beca5..728e5e6 100644
 --- tensorfold/vision/images.py
 +++ tensorfold/vision/images.py
-@@ -114,9 +114,11 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+@@ -122,9 +122,11 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
  
  
  def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
 -                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
 +                 allow_videos: bool = False, max_videos: int | None = None
 +                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
-     """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
--    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
-+    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
+     """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
+-    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
++    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
 +    (default: the shared video limits')."""
      if not isinstance(messages, list) or not messages:
          raise ImageInputError("messages must be a non-empty list")
      output, sources = [], []
-@@ -150,9 +152,10 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+@@ -158,9 +160,10 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+                     raise ImageInputError("video_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"video_url"}):
+                     raise ImageInputError("video_url parts cannot contain other media")
++                most = max_videos or DEFAULT_VIDEO_LIMITS.max_videos
+                 videos = sum(type(s).__name__ == "VideoSource" for s in sources)
+-                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
+-                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
++                if videos >= most:
++                    raise ImageInputError(f"a request supports at most {most} videos")
+                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
+                 parts.append({"type": "video"})
+             elif kind == "image_url":
+diff --git tensorfold/vision/images.py.orig tensorfold/vision/images.py.orig
+index 43beca5..728e5e6 100644
+--- tensorfold/vision/images.py.orig
++++ tensorfold/vision/images.py.orig
+@@ -122,9 +122,11 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+ 
+ 
+ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
+-                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
++                 allow_videos: bool = False, max_videos: int | None = None
++                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+     """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
+-    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
++    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
++    (default: the shared video limits')."""
+     if not isinstance(messages, list) or not messages:
+         raise ImageInputError("messages must be a non-empty list")
+     output, sources = [], []
+@@ -158,9 +160,10 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
                      raise ImageInputError("video_url parts are supported only in user messages")
                  if any(part.get(key) for key in _MEDIA - {"video_url"}):
                      raise ImageInputError("video_url parts cannot contain other media")

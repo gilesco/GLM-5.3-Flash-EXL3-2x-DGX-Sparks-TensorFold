@@ -1,6 +1,3 @@
-# Kept prompt cap: past TF_GLM_CACHE_ENTRIES a conversation's superseded (shorter) kept states go first, then the
-# least recently used. By @Alexbob0 (PR #32), rebased on 0054. Same replies.
-
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
 index 1b2efbc..840d182 100644
 --- tensorfold/families/glm5_next/cuda/multi.py

@@ -1,8 +1,8 @@
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index f09d0dd..cb39952 100644
+index 9fcb76a..30d49bc 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -429,6 +429,48 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -431,6 +431,48 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
  
  
@@ -51,6 +51,98 @@ index f09d0dd..cb39952 100644
  def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
      m = layer.mlp
      mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 5e2fdd9..9fcb76a 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -19,6 +19,21 @@ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+ 
++# rows a prompt chunk's dense latent attention runs at once (its partials' rows; the startup estimate's)
++from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS  # noqa: E402
++
++
++def prompt_split_k(w: Weights) -> bool:
++    """Whether a prompt chunk's projections take split-K partials: an EXL3 checkpoint's BF16 / FP8 ones do; 4-bit
++    ones (an MLX checkpoint, TF_GLM_DENSE=q4, read off the first layer's input projection) run without."""
++
++    if w.cfg.quant != "exl3":
++        return False
++    first = next((l.kda.proj if l.kda is not None else l.dsa.proj for l in w.layers
++                  if getattr(l, "kda", None) is not None or getattr(l, "dsa", None) is not None), None)
++    return not isinstance(first, qmm.Q4)
++
++
+ class Buffers:
+     """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
+ 
+@@ -38,9 +53,12 @@ class Buffers:
+         if latent.ENABLED:
+             # Dense attention only ever covers contexts up to the dense limit; longer rows go sparse.
+             self.attn = None
+-            # a prompt chunk's dense pass runs PROMPT_ATT_ROWS rows at a time: its fp32 partials hold that many rows
++            # a prompt chunk's dense pass runs PROMPT_ATT_ROWS rows at a time (``dense_attention``): its fp32
++            # partials hold that many rows, not the chunk's
+             self.lat_s = latent.LatentScratch(rows, HL, latent.chunks_for(min(capacity, 2560) + rows), dev,
+                                               lw=c.kv_lora, part_rows=PROMPT_ATT_ROWS if prefill else rows)
++            self.att_starts = (torch.arange(0, rows, self.lat_s.part_rows, dtype=torch.int32, device=dev)
++                               if prefill else None)
+         else:
+             self.attn = AttnScratch(1 if prefill else rows, HL, c.qk_dim, capacity, dev)
+         if prefill:
+@@ -108,7 +126,10 @@ class Buffers:
+         # rank partials
+         self.part = torch.empty((rows, D), dtype=f32, device=dev)
+         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
+-        self.sk = torch.empty((1 if prefill and not exl3 else 8 * rows * 16384,), dtype=f32, device=dev)
++        # split-K partials of BF16 / FP8 projections (``mm``): a prompt chunk's 4-bit ones run the prompt matmul, which
++        # keeps none, so an MLX checkpoint's and TF_GLM_DENSE=q4's prompt buffers hold none (the FP8 head's one row
++        # allocates its few itself); a partials buffer holds scratch only, so where it lives never changes a bit
++        self.sk = torch.empty((1 if prefill and not prompt_split_k(w) else 8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+         self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -346,19 +367,22 @@ def dense_rows(c, R: int, host_pos: int | None) -> int:
+     return min(R, max(0, sparse.SPARSE_FROM - host_pos))
+ 
+ 
+-def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s: latent.LatentScratch, *,
+-                    scale: float, nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
+-    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row
+-    (``hb``: the window's ``head_block``, which a window's first rows computed alone keep)."""
++def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s, *, scale: float, nch: int,
++                    out: torch.Tensor, hb: int, starts: torch.Tensor | None = None) -> torch.Tensor:
++    """``latent.attention`` of qa's rows in blocks of the scratch's ``part_rows`` (block i's queries at device
++    position pos_dev + starts[i], ``starts`` = arange(0, rows, part_rows)): every row gets the bits of one call over
++    all of them, since a row's programs read only its query, keys up to its position and its own partials, and
++    ``hb`` and ``nch`` stay the window's (``latent.attention``)."""
+ 
+     R, step = qa.shape[0], s.part_rows
+-    hb = latent.head_block(R) if hb is None else hb
+     if R <= step:
+         return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
+-    for r0 in range(0, R, step):
++    if starts is None or starts.numel() < -(-R // step):
++        raise ValueError(f"dense attention of {R} rows in blocks of {step} needs the blocks' start offsets")
++    at = pos_dev + starts                                  # each block's first row's position, on the device
++    for i, r0 in enumerate(range(0, R, step)):
+         r1 = min(R, r0 + step)
+-        at = pos_dev if r0 == 0 else pos_dev + r0          # the block's first row's position, on the device
+-        latent.attention(qa[r0:r1], lc, at, s, scale=scale, nch=nch, out=out[r0:r1], hb=hb)
++        latent.attention(qa[r0:r1], lc, at[i:i + 1], s, scale=scale, nch=nch, out=out[r0:r1], hb=hb)
+     return out
+ 
+ 
+@@ -391,7 +415,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+         dense = dense_rows(c, R, host_pos) if sparse_rows else R
+         with prof.timed("dsa: dense attention"):
+             dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
+-                            hb=latent.head_block(R))
++                            hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
+     if sparse_rows:
+         with prof.timed("dsa: select tokens"):
+             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
 diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
 index 3026586..1cecc96 100644
 --- tensorfold/families/glm5_next/cuda/latent.py

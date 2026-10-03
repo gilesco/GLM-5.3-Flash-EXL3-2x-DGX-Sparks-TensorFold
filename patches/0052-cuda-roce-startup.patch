@@ -97,7 +97,7 @@ index bba421c..93535a4 100644
              if r is not recv:
                  recv.copy_(r)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index f021d02..267e84c 100644
+index e04f46c..c5e40b5 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -683,6 +683,8 @@ class GlmEngine:

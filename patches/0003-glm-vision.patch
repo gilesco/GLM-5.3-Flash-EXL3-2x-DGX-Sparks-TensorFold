@@ -1,8 +1,8 @@
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index 552720d..3707349 100644
+index 3253e83..fa9509f 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -408,11 +408,15 @@ class App:
+@@ -507,11 +507,15 @@ class App:
                  end = None if think_end is None or think_end in ids[len(prompt):] else think_end
                  extra["constraint"] = self._grammars().constraint(compiled, think_end=end, spec=spec)
              if prepared.vision is not None:          # a gate's continuation keeps the images, positions extended
@@ -23,7 +23,7 @@ index 552720d..3707349 100644
              if not cached:
                  cached.append(int((stats or {}).get("cached") or 0))
 diff --git tensorfold/families/glm5_next/__init__.py tensorfold/families/glm5_next/__init__.py
-index 5d8cac3..a2f4a6f 100644
+index fd7a3e0..d3b7528 100644
 --- tensorfold/families/glm5_next/__init__.py
 +++ tensorfold/families/glm5_next/__init__.py
 @@ -222,7 +222,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
@@ -37,7 +37,7 @@ index 5d8cac3..a2f4a6f 100644
  
  def __getattr__(name: str) -> Any:
 diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
-index 0b6d35e..350e5b0 100644
+index 3d21cac..9765883 100644
 --- tensorfold/families/glm5_next/cuda/app.py
 +++ tensorfold/families/glm5_next/cuda/app.py
 @@ -2,6 +2,7 @@
@@ -48,13 +48,14 @@ index 0b6d35e..350e5b0 100644
  from typing import Any, Callable
  
  from tensorfold.cuda.server import App, PreparedRequest, RequestError
-@@ -15,16 +16,38 @@ class ThinkingOffTemplate:
-         self.inner = inner
+@@ -19,17 +20,39 @@ class ThinkingOffTemplate:
          self.efforts = getattr(inner, "efforts", frozenset())
+         self.clear = clear_thinking() if clear is None else clear
  
 -    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
--        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
 +    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+         extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
+-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
 +        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
 +                                 allow_images=allow_images)
          return text if enable_thinking else thinking_off(text)
@@ -116,7 +117,7 @@ index f8b4ec4..4850d92 100644
          if 0 < point <= R:
              rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index b29529c..47d2a02 100644
+index 220a36a..84be913 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -19,6 +19,22 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
@@ -242,7 +243,7 @@ index b29529c..47d2a02 100644
          stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
                       tokens_per_round=round((len(res.tokens) - 1) / max(res.rounds, 1), 3),
                       sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
-@@ -487,8 +532,8 @@ class GlmEngine:
+@@ -489,8 +534,8 @@ class GlmEngine:
          return stats
  
      def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
@@ -253,7 +254,7 @@ index b29529c..47d2a02 100644
  
          if len(prompt) >= self.limit:
              raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
-@@ -499,13 +544,27 @@ class GlmEngine:
+@@ -501,13 +546,27 @@ class GlmEngine:
              spec = getattr(self.request, "policy", None) or self.policy
          code = self._effective(encode_policy(spec))
          stop_eos = bool(getattr(self.request, "stop_eos", True))
@@ -283,7 +284,7 @@ index b29529c..47d2a02 100644
          from tensorfold.engine.grammar import pack
  
          self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
-@@ -513,8 +572,12 @@ class GlmEngine:
+@@ -515,8 +574,12 @@ class GlmEngine:
          self._share(list(prompt))
          if constraint is not None:                     # the request's grammar: rank 1 compiles the same
              self._share(pack(constraint))
@@ -296,17 +297,17 @@ index b29529c..47d2a02 100644
 +            stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3))
          return stats
  
-     def follow(self) -> None:
-@@ -525,7 +588,7 @@ class GlmEngine:
-         while True:
-             self._await_bell()
+     def score_labels(self, prompt_ids: list[int], label_ids: list[int]) -> tuple[list[float], float]:
+@@ -574,7 +637,7 @@ class GlmEngine:
+                 self._score_local(prompt, labels)
+                 continue
              (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
--             *code) = self._share(None)
-+             images, *code) = self._share(None)
+-             *code) = header
++              images, *code) = header
              prompt = self._share(None)
              packed = self._share(None) if shaped else []
              constraint = None
-@@ -533,6 +596,7 @@ class GlmEngine:
+@@ -582,6 +645,7 @@ class GlmEngine:
                  from tensorfold.engine import grammar
  
                  constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
@@ -314,7 +315,7 @@ index b29529c..47d2a02 100644
              temperature = _ints_f64(t_lo, t_hi)
              seed = (s_top << 62) | (s_hi << 31) | s_lo
              sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
-@@ -543,4 +607,32 @@ class GlmEngine:
+@@ -592,4 +656,32 @@ class GlmEngine:
                  if hit is None:
                      raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
              self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
@@ -349,10 +350,10 @@ index b29529c..47d2a02 100644
 +        index = torch.tensor([p - start for p in self.positions[lo:hi]], dtype=torch.int64, device="cuda")
 +        return index, both[:n]
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index f73f253..225109f 100644
+index 56a10f4..d69d001 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -472,13 +472,16 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+@@ -474,13 +474,16 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
  
  
  def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
@@ -372,93 +373,37 @@ index f73f253..225109f 100644
          layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
          for slot in b.tap_at.get(layer.index, ()):
 diff --git tensorfold/serve_options.py tensorfold/serve_options.py
-index 658f828..f36736e 100644
+index db35baf..ec3879a 100644
 --- tensorfold/serve_options.py
 +++ tensorfold/serve_options.py
-@@ -13,8 +13,6 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
-     if getattr(args, "vision_urls", False) and not getattr(args, "vision", False):
-         raise ValueError("--vision-urls needs --vision")
+@@ -33,8 +33,6 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
+         if backend != "cuda":
+             raise ValueError("--vision-offload is for the CUDA backend; the Mac's image tower already shares host memory")
      if getattr(args, "vision", False):             # only --vision reads the config here
 -        if family.model_type == "glm5_next" and backend != "mlx":
 -            raise ValueError("GLM-5.3-Flash image input is currently MLX-only")
          from tensorfold.families import read_config
          from tensorfold.vision.config import validate_vision_config
  
-diff --git tensorfold/server/messages.py tensorfold/server/messages.py
-index 24bbd82..dde2b67 100644
---- tensorfold/server/messages.py
-+++ tensorfold/server/messages.py
-@@ -28,6 +28,9 @@ def late_system_role(render: Callable[[list[dict[str, Any]]], Any]) -> str:
-         return "user"
- 
- 
-+_VISUAL = ("image_url", "image", "video_url", "video")      # a video part reaches here only where videos are on
-+
-+
- def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "system",
-                        allow_images: bool = False) -> list[dict[str, Any]]:
-     """Merge leading instructions as system text and retain later instructions as ``late_system`` so earlier conversation tokens stay unchanged."""
-@@ -45,12 +48,12 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
-             raise RequestError("this server accepts text only; image, audio and video inputs are unsupported")
-         content = message.get("content")
-         if isinstance(content, list) and allow_images and any(
--                isinstance(p, dict) and p.get("type") in ("image_url", "image") for p in content):
-+                isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
-             if role != "user":
--                raise RequestError("images are supported only in user messages")
-+                raise RequestError("images and videos are supported only in user messages")
-             for part in content:
--                if not isinstance(part, dict) or part.get("type") not in ("text", "image_url", "image"):
--                    raise RequestError("image messages may contain text and image_url parts only")
-+                if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
-+                    raise RequestError("image messages may contain text and image_url (or video_url) parts only")
-                 if part["type"] == "text" and not isinstance(part.get("text"), str):
-                     raise RequestError("a text content part must contain a text string")
-             out.append({**message, "content": list(content)})
 diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
-index 1b709a7..ee19680 100644
+index 37fbe24..8d171e9 100644
 --- tensorfold/server/prompts.py
 +++ tensorfold/server/prompts.py
-@@ -18,7 +18,7 @@ class RenderedPrompt:
- 
- def has_images(messages):
-     return any(isinstance(m, dict) and isinstance(m.get('content'), list)
--               and any(isinstance(p, dict) and p.get('type') == 'image_url' for p in m['content'])
-+               and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
-                for m in messages or [])
- 
- 
-@@ -45,14 +45,27 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
-     if frontend is None:
-         raise RequestError('image input requires a supported vision checkpoint served with --vision')
-     allow_urls = bool(getattr(frontend, 'allow_urls', False))
-+    videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
-     try:
--        template, sources = split_images(messages, allow_urls=allow_urls)
-+        template, sources = split_images(messages, allow_urls=allow_urls, allow_videos=videos)
-     except (ImageInputError, ValueError) as exc:
-         raise RequestError(str(exc)) from exc
-     slot = image_slot()
-     try:
--        images = load_images(sources, allow_urls=allow_urls)
--        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
-+        from tensorfold.vision.images import ImageSource
-+
-+        images = load_images([s for s in sources if isinstance(s, ImageSource)], allow_urls=allow_urls)
-+        clips = [s for s in sources if not isinstance(s, ImageSource)]
-+        if clips:
+@@ -58,9 +58,12 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
+             {"max_visual_tokens": limits.max_visual_tokens}
+         clips = [s for s in sources if not isinstance(s, ImageSource)]
+         if clips:
+-            from tensorfold.vision.videos import load_videos
 +            if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
-+                clips = frontend.load_videos(clips)
++                budget["videos"] = frontend.load_videos(clips)
 +            else:
 +                from tensorfold.vision.videos import load_videos
-+
-+                clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
-+            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
-+        else:
-+            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+ 
+-            budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
++                budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+         prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
      except (ImageInputError, ValueError, ImportError) as exc:
-         raise RequestError(str(exc)) from exc
-     finally:
+         raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded
 diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
 new file mode 100644
 index 0000000..77a96f9
@@ -956,28 +901,165 @@ index 0000000..77a96f9
 +
 +        self.tower.features([("image", torch.zeros((3, 56, 56), dtype=torch.uint8))])
 +        torch.cuda.synchronize()
-diff --git tensorfold/vision/images.py tensorfold/vision/images.py
-index cd4b1d2..e68c516 100644
---- tensorfold/vision/images.py
-+++ tensorfold/vision/images.py
-@@ -113,9 +113,10 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
-         raise ImageInputError("image URL is too long")
- 
- 
--def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False
--                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
--    """Preserve ordered parts, replacing user image URLs with processor image markers."""
+diff --git tensorfold/vision/images.py.orig tensorfold/vision/images.py.orig
+new file mode 100644
+index 0000000..43beca5
+--- /dev/null
++++ tensorfold/vision/images.py.orig
+@@ -0,0 +1,262 @@
++"""CPU image inputs canonicalized to immutable, oriented RGB pixels."""
++
++from __future__ import annotations
++
++import base64
++import binascii
++import hashlib
++import io
++import math
++import struct
++import time
++import warnings
++from dataclasses import dataclass, field
++from typing import Any
++from urllib.parse import unquote_to_bytes
++
++from .images_http import MEDIA_TYPES, ImageInputError, fetch_image
++
++_DETAILS = {"auto", "low", "high"}
++_FORMATS = tuple(MEDIA_TYPES.values())
++_MEDIA = {"image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url"}
++
++
++@dataclass(frozen=True, slots=True)
++class ImageLimits:
++    max_images: int = 4
++    max_encoded_bytes: int = 10 * 1024 * 1024
++    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_dimension: int = 8192
++    max_pixels: int = 16 * 1024 * 1024
++    max_total_pixels: int = 32 * 1024 * 1024
++    timeout_seconds: float = 10.0
++    total_timeout_seconds: float = 30.0
++    max_redirects: int = 3
++    max_url_chars: int = 4096
++    max_visual_tokens: int = 4096        # the tokens a request's images share (CUDA Qwen: --vision-image-tokens)
++
++    def __post_init__(self) -> None:
++        for name in self.__dataclass_fields__:
++            value = getattr(self, name)
++            if (not isinstance(value, (int, float)) or isinstance(value, bool)
++                    or not math.isfinite(value) or value < 0 or (name != "max_redirects" and value == 0)):
++                raise ValueError(f"{name} must be finite and positive, except zero redirects")
++            if name not in {"timeout_seconds", "total_timeout_seconds"} and not isinstance(value, int):
++                raise ValueError(f"{name} must be an integer")
++
++
++DEFAULT_LIMITS = ImageLimits()
++
++
++def _count_error(limits: ImageLimits) -> ImageInputError:
++    return ImageInputError(
++        f"a request supports at most {limits.max_images} images across the full message history, "
++        "including prior turns; remove older image content, start a new conversation, or restart the server "
++        "with --vision-max-images N to raise the count limit (other image limits still apply)")
++
++
++@dataclass(frozen=True, slots=True)
++class ImageSource:
++    url: str
++    detail: str = "auto"
++
++
++@dataclass(frozen=True, slots=True)
++class ImageInput:
++    width: int
++    height: int
++    pixels: bytes
++    detail: str = "auto"
++    content_hash: str = field(init=False)
++
++    def __post_init__(self) -> None:
++        if (not isinstance(self.pixels, bytes)
++                or any(type(size) is not int or not 0 < size < 2**32 for size in (self.width, self.height))
++                or len(self.pixels) != self.width * self.height * 3
++                or not isinstance(self.detail, str) or self.detail not in _DETAILS):
++            raise ImageInputError("image input requires RGB bytes, matching dimensions and valid detail")
++        digest = hashlib.sha256(b"tensorfold-rgb-v1\0" + struct.pack(">II", self.width, self.height))
++        digest.update(self.pixels)
++        object.__setattr__(self, "content_hash", digest.hexdigest())
++
++    def to_pil(self):
++        """Return a fresh mutable RGB image; cached pixels remain immutable."""
++        image, _ = _pillow()
++        return image.frombytes("RGB", (self.width, self.height), self.pixels)
++
++
++def _pillow():
++    try:
++        from PIL import Image, ImageOps
++    except ImportError:
++        raise ImageInputError("image inputs require Pillow; install tensorfold[vision]") from None
++    return Image, ImageOps
++
++
++def _source(value: Any, limits: ImageLimits, allow_urls: bool) -> ImageSource:
++    if not isinstance(value, dict) or not isinstance(value.get("url"), str) or not value["url"]:
++        raise ImageInputError("image_url must contain a non-empty url string")
++    detail = value.get("detail", "auto")
++    if not isinstance(detail, str) or detail not in _DETAILS:
++        raise ImageInputError("image detail must be auto, low or high")
++    source = ImageSource(value["url"], detail)
++    _check_source(source, limits, allow_urls)
++    return source
++
++
++def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = False) -> None:
++    if not isinstance(source, ImageSource) or not isinstance(source.url, str) or not source.url:
++        raise ImageInputError("image source must contain a non-empty URL")
++    if not isinstance(source.detail, str) or source.detail not in _DETAILS:
++        raise ImageInputError("image detail must be auto, low or high")
++    if source.url.startswith("data:"):
++        if len(source.url) > limits.max_encoded_bytes * 3 + 256:
++            raise ImageInputError("image data URL exceeds the encoded byte limit")
++    elif not source.url.startswith("https://"):
++        raise ImageInputError("images require data URLs or public HTTPS URLs")
++    elif not allow_urls:
++        raise ImageInputError("image URLs are off on this server; send the image as a data URL, or start the server "
++                              "with --vision-urls")
++    elif len(source.url) > limits.max_url_chars:
++        raise ImageInputError("image URL is too long")
++
++
 +def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
 +                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
-+    """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
-+    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
-     if not isinstance(messages, list) or not messages:
-         raise ImageInputError("messages must be a non-empty list")
-     output, sources = [], []
-@@ -142,18 +143,32 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
-                 if not isinstance(part.get("text"), str) or any(part.get(key) for key in _MEDIA):
-                     raise ImageInputError("text parts must contain a text string without media")
-                 parts.append(dict(part))
++    """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
++    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
++    if not isinstance(messages, list) or not messages:
++        raise ImageInputError("messages must be a non-empty list")
++    output, sources = [], []
++    for message in messages:
++        if not isinstance(message, dict):
++            raise ImageInputError("each message must be an object")
++        role = message.get("role")
++        if not isinstance(role, str) or role not in {"system", "developer", "user", "assistant", "tool"}:
++            raise ImageInputError("invalid message role")
++        if any(message.get(key) for key in _MEDIA):
++            raise ImageInputError("images must be image_url parts in user or tool message content")
++        content = message.get("content")
++        if content is None or isinstance(content, str):
++            output.append(dict(message))
++            continue
++        if not isinstance(content, list):
++            raise ImageInputError("message content must be text or an array of content parts")
++        parts = []
++        for part in content:
++            if not isinstance(part, dict):
++                raise ImageInputError("each content part must be an object")
++            kind = part.get("type")
++            if kind == "text":
++                if not isinstance(part.get("text"), str) or any(part.get(key) for key in _MEDIA):
++                    raise ImageInputError("text parts must contain a text string without media")
++                parts.append(dict(part))
 +            elif kind == "video_url" and allow_videos:
 +                from .videos import DEFAULT_VIDEO_LIMITS, video_source
 +
@@ -990,250 +1072,100 @@ index cd4b1d2..e68c516 100644
 +                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
 +                sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
 +                parts.append({"type": "video"})
-             elif kind == "image_url":
-                 if role != "user":
-                     raise ImageInputError("image_url parts are supported only in user messages")
-                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
-                     raise ImageInputError("image_url parts cannot contain other media")
--                if len(sources) >= limits.max_images:
++            elif kind == "image_url":
++                if role not in ("user", "tool"):
++                    raise ImageInputError("image_url parts are supported only in user and tool messages")
++                if any(part.get(key) for key in _MEDIA - {"image_url"}):
++                    raise ImageInputError("image_url parts cannot contain other media")
 +                if sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
-                     raise ImageInputError(f"a request supports at most {limits.max_images} images")
-                 source = _source(part.get("image_url"), limits, allow_urls)
-                 sources.append(source)
-                 parts.append({"type": "image", "detail": source.detail})
-             else:
--                raise ImageInputError("content parts must be text or image_url; audio and video are unsupported")
++                    raise _count_error(limits)
++                source = _source(part.get("image_url"), limits, allow_urls)
++                sources.append(source)
++                parts.append({"type": "image", "detail": source.detail})
++            else:
 +                raise ImageInputError("content parts must be text, image_url or video_url; audio is unsupported"
 +                                      if allow_videos else
 +                                      "content parts must be text or image_url; audio and video are unsupported")
-         output.append({**message, "content": parts})
-     return output, sources
- 
-diff --git tensorfold/vision/images_http.py tensorfold/vision/images_http.py
-index 16d6627..f354aea 100644
---- tensorfold/vision/images_http.py
-+++ tensorfold/vision/images_http.py
-@@ -109,7 +109,7 @@ def _close_socket(sock: socket.socket) -> None:
- 
- 
- def _request(host: str, port: int, target: str, addresses: list[tuple],
--             max_bytes: int, deadline: float) -> tuple[bytes | None, str | None, str | None]:
-+             max_bytes: int, deadline: float, media_types=MEDIA_TYPES) -> tuple[bytes | None, str | None, str | None]:
-     """A watchdog bounds slow headers and TLS handshakes, not just individual reads."""
-     timeout = _remaining(deadline)
-     family, kind, protocol, _, address = addresses[0]
-@@ -128,7 +128,7 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
-         sock.settimeout(_remaining(deadline))
-         sock.do_handshake()
-         connection.sock = sock
--        connection.request("GET", target, headers={"Accept": ", ".join(MEDIA_TYPES), "Accept-Encoding": "identity",
-+        connection.request("GET", target, headers={"Accept": ", ".join(media_types), "Accept-Encoding": "identity",
-                                                    "User-Agent": f"TensorFold/{__version__}"})
-         response = connection.getresponse()
-         _remaining(deadline)
-@@ -142,8 +142,9 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
-         if response.getheader("Content-Encoding", "identity").lower() != "identity":
-             raise ImageInputError("compressed HTTP image responses are unsupported")
-         media = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
--        if media not in MEDIA_TYPES:
--            raise ImageInputError("image URL content type must be JPEG, PNG or WebP")
-+        if media not in media_types:
-+            raise ImageInputError("image URL content type must be JPEG, PNG or WebP" if media_types is MEDIA_TYPES
-+                                  else f"media URL content type must be one of {', '.join(media_types)}")
-         length = response.getheader("Content-Length")
-         if length is not None:
-             if not length.isascii() or not length.isdecimal() or int(length) > max_bytes:
-@@ -166,13 +167,13 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
- 
- 
- def fetch_image(url: str, *, max_bytes: int, deadline: float, max_redirects: int,
--                max_url_chars: int) -> tuple[bytes, str]:
-+                max_url_chars: int, media_types=MEDIA_TYPES) -> tuple[bytes, str]:
-     """Resolve and validate each redirect, then connect directly to its checked address."""
-     try:
-         for redirect in range(max_redirects + 1):
-             host, port, target = _url(url, max_url_chars)
-             addresses = _resolve(host, port, deadline)
--            data, location, media = _request(host, port, target, addresses, max_bytes, deadline)
-+            data, location, media = _request(host, port, target, addresses, max_bytes, deadline, media_types)
-             if location is None:
-                 return data, media
-             if redirect == max_redirects:
-diff --git tensorfold/vision/videos.py tensorfold/vision/videos.py
-new file mode 100644
-index 0000000..271f7ce
---- /dev/null
-+++ tensorfold/vision/videos.py
-@@ -0,0 +1,172 @@
-+"""CPU video inputs: bounded bytes, frames sampled at a fixed rate, decoded straight to the tower's resolution."""
-+
-+from __future__ import annotations
-+
-+import hashlib
-+import io
-+import math
-+import time
-+from dataclasses import dataclass, field
-+from typing import Any, Callable
-+
-+import numpy as np
-+
-+from .images import _data_bytes
-+from .images_http import ImageInputError, fetch_image
-+
-+VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-matroska": "mkv"}
++        output.append({**message, "content": parts})
++    return output, sources
 +
 +
-+@dataclass(frozen=True, slots=True)
-+class VideoLimits:
-+    max_videos: int = 2
-+    max_encoded_bytes: int = 64 * 1024 * 1024
-+    max_total_encoded_bytes: int = 96 * 1024 * 1024
-+    max_dimension: int = 8192
-+    max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
-+    fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)
-+    min_frames: int = 4
-+    max_frames: int = 256                 # a longer video is sampled more sparsely, over its whole length
-+    timeout_seconds: float = 20.0
-+    total_timeout_seconds: float = 120.0
-+    max_redirects: int = 3
-+    max_url_chars: int = 4096
-+
-+
-+DEFAULT_VIDEO_LIMITS = VideoLimits()
-+
-+
-+@dataclass(frozen=True, slots=True)
-+class VideoSource:
-+    url: str
-+
-+
-+@dataclass(frozen=True, slots=True)
-+class VideoInput:
-+    frames: np.ndarray            # [frames, height, width, 3] uint8, already at the tower's resolution
-+    indices: tuple[int, ...]      # each frame's index in the source
-+    fps: float                    # the source's frame rate
-+    content_hash: str = field(init=False)
-+
-+    def __post_init__(self) -> None:
-+        if (not isinstance(self.frames, np.ndarray) or self.frames.dtype != np.uint8 or self.frames.ndim != 4
-+                or self.frames.shape[-1] != 3 or len(self.indices) != self.frames.shape[0] or not self.indices
-+                or not math.isfinite(self.fps) or self.fps <= 0):
-+            raise ImageInputError("video input requires RGB frames, one index each and a positive frame rate")
-+        self.frames.setflags(write=False)
-+        digest = hashlib.sha256(b"tensorfold-video-v1\0" + np.asarray(self.frames.shape, dtype=">u4").tobytes())
-+        digest.update(np.asarray(self.indices, dtype=">u8").tobytes())
-+        digest.update(self.frames.tobytes())
-+        object.__setattr__(self, "content_hash", digest.hexdigest())
-+
-+    def timestamps(self, temporal: int) -> list[float]:
-+        """Each group of ``temporal`` frames' time: the mean of its first and last frame (Qwen3-VL's processor)."""
-+        indices = list(self.indices)
-+        if len(indices) % temporal:
-+            indices.extend(indices[-1] for _ in range(temporal - len(indices) % temporal))
-+        seconds = [i / self.fps for i in indices]
-+        return [(seconds[i] + seconds[i + temporal - 1]) / 2 for i in range(0, len(seconds), temporal)]
-+
-+
-+def video_source(value: Any, limits: VideoLimits, allow_urls: bool) -> VideoSource:
-+    if not isinstance(value, dict) or not isinstance(value.get("url"), str) or not value["url"]:
-+        raise ImageInputError("video_url must contain a non-empty url string")
-+    url = value["url"]
-+    if url.startswith("data:"):
-+        if len(url) > limits.max_encoded_bytes * 3 // 2 + 256:
-+            raise ImageInputError("video data URL exceeds the encoded byte limit")
-+    elif not url.startswith("https://"):
-+        raise ImageInputError("videos require data URLs or public HTTPS URLs")
-+    elif not allow_urls:
-+        raise ImageInputError("video URLs are off on this server; send the video as a data URL, or start the server "
-+                              "with --vision-urls")
-+    elif len(url) > limits.max_url_chars:
-+        raise ImageInputError("video URL is too long")
-+    return VideoSource(url)
-+
-+
-+def _av():
++def _data_bytes(url: str, max_bytes: int) -> bytes:
++    header, separator, payload = url.partition(",")
++    if not separator or len(header) > 256:
++        raise ImageInputError("invalid image data URL")
++    media = header[5:].split(";")
++    if len(media) > 2 or (len(media) == 2 and media[1].lower() != "base64"):
++        raise ImageInputError("image data URL supports only optional base64 encoding")
++    max_chars = 4 * ((max_bytes + 2) // 3) if len(media) == 2 else max_bytes * 3
++    if len(payload) > max_chars:
++        raise ImageInputError("image data URL exceeds the encoded byte limit")
++    if not payload.isascii():
++        raise ImageInputError("invalid image data URL encoding")
 +    try:
-+        import av
-+    except ImportError:
-+        raise ImageInputError("video inputs require PyAV (pip install av)") from None
-+    return av
++        if len(media) == 2:
++            data = base64.b64decode(payload, validate=True)
++        else:
++            data = unquote_to_bytes(payload)
++    except (ValueError, binascii.Error):
++        raise ImageInputError("invalid image data URL encoding") from None
++    if not data or len(data) > max_bytes:
++        raise ImageInputError("image is empty or exceeds the encoded byte limit")
++    return data
 +
 +
-+def sample_indices(total: int, fps: float, limits: VideoLimits) -> np.ndarray:
-+    """Qwen3-VL's frame choice: ``limits.fps`` frames a second (at least min_frames, at most max_frames) spread
-+    evenly over the whole video."""
-+    count = int(total / fps * limits.fps)
-+    count = min(max(count, limits.min_frames), limits.max_frames, total)
-+    return np.linspace(0, total - 1, count).round().astype(int)
-+
-+
-+def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], limits: VideoLimits,
-+                 deadline: float) -> VideoInput:
-+    """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic)."""
-+    av = _av()
++def _decode(data: bytes, detail: str, limits: ImageLimits, remaining_pixels: int) -> ImageInput:
++    image, image_ops = _pillow()
 +    try:
-+        with av.open(io.BytesIO(data), mode="r") as container:
-+            if not container.streams.video:
-+                raise ImageInputError("the video has no video stream")
-+            stream = container.streams.video[0]
-+            stream.thread_type = "AUTO"
-+            width, height = int(stream.codec_context.width or 0), int(stream.codec_context.height or 0)
-+            if min(width, height) <= 0 or max(width, height) > limits.max_dimension:
-+                raise ImageInputError("video dimensions are missing or exceed the pixel limit")
-+            rate = stream.average_rate or stream.guessed_rate or 24
-+            fps = float(rate)
-+            seconds = float(stream.duration * stream.time_base) if stream.duration else (
-+                container.duration / 1e6 if container.duration else 0.0)
-+            total = int(stream.frames or round(seconds * fps))
-+            if not 0 < fps <= 1000 or total <= 0:
-+                raise ImageInputError("the video's frame count or rate is missing")
-+            if total / fps > limits.max_seconds:
-+                raise ImageInputError(f"videos are limited to {limits.max_seconds / 60:.0f} minutes")
-+            wanted = sample_indices(total, fps, limits)
-+            out_h, out_w = size(len(wanted), height, width)
-+            keep = set(int(i) for i in wanted)
-+            frames, indices = [], []
-+            for n, frame in enumerate(container.decode(stream)):
-+                if n > wanted[-1] or time.monotonic() >= deadline:
-+                    break
-+                if n in keep:
-+                    frames.append(frame.to_ndarray(format="rgb24", width=out_w, height=out_h,
-+                                                   interpolation="BICUBIC"))
-+                    indices.append(n)
-+            if time.monotonic() >= deadline:
-+                raise ImageInputError("video decoding exceeds the time limit")
++        with warnings.catch_warnings():
++            warnings.simplefilter("error", image.DecompressionBombWarning)
++            with image.open(io.BytesIO(data), formats=_FORMATS) as source:
++                width, height = source.size
++                if (min(width, height) <= 0 or max(width, height) > limits.max_dimension
++                        or width * height > min(limits.max_pixels, remaining_pixels)):
++                    raise ImageInputError("image dimensions exceed the decoded pixel limit")
++                if getattr(source, "n_frames", 1) != 1:
++                    raise ImageInputError("animated and multipage images are unsupported; send a single frame")
++                source.verify()
++            with image.open(io.BytesIO(data), formats=_FORMATS) as source:
++                source.load()
++                oriented = image_ops.exif_transpose(source)
++                if "A" in oriented.getbands() or "transparency" in oriented.info:
++                    rgba = oriented.convert("RGBA")
++                    rgb = image.new("RGB", oriented.size, "white")
++                    rgb.paste(rgba, mask=rgba.getchannel("A"))
++                else:
++                    rgb = oriented.convert("RGB")
++                return ImageInput(rgb.width, rgb.height, rgb.tobytes(), detail)
 +    except ImageInputError:
 +        raise
-+    except (OSError, ValueError, MemoryError) as exc:
-+        raise ImageInputError(f"video bytes are invalid or unsupported ({type(exc).__name__}); use MP4 or "
-+                              "WebM") from None
-+    if len(frames) < 2:
-+        raise ImageInputError("the video has fewer than two decodable frames")
-+    return VideoInput(np.stack(frames), tuple(indices), fps)
++    except (OSError, ValueError, SyntaxError, image.DecompressionBombWarning, image.DecompressionBombError):
++        raise ImageInputError("image bytes are invalid or unsupported; use JPEG, PNG or WebP") from None
 +
 +
-+def load_videos(sources: list[VideoSource], size: Callable[[int, int, int], tuple[int, int]], *,
-+                limits: VideoLimits = DEFAULT_VIDEO_LIMITS, allow_urls: bool = False) -> list[VideoInput]:
-+    """Bound encoded bytes and decoding time across the videos of one request."""
-+    if len(sources) > limits.max_videos:
-+        raise ImageInputError(f"a request supports at most {limits.max_videos} videos")
-+    total = 0
++def load_images(sources: list[ImageSource], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False
++                ) -> list[ImageInput]:
++    """Bound encoded bytes and decoded pixels across all images in one request."""
++    if not isinstance(sources, (list, tuple)) or len(sources) > limits.max_images:
++        raise _count_error(limits)
++    total_bytes, total_pixels = 0, 0
 +    deadline = time.monotonic() + limits.total_timeout_seconds
 +    output = []
 +    for source in sources:
-+        remaining = min(limits.max_encoded_bytes, limits.max_total_encoded_bytes - total)
++        _check_source(source, limits, allow_urls)
++        remaining = min(limits.max_encoded_bytes, limits.max_total_encoded_bytes - total_bytes)
 +        if remaining <= 0 or time.monotonic() >= deadline:
-+            raise ImageInputError("video request exceeds the total byte or time limit")
++            raise ImageInputError("image request exceeds the total byte or time limit")
 +        if source.url.startswith("data:"):
 +            data = _data_bytes(source.url, remaining)
-+        elif allow_urls:
++        else:
 +            data, _ = fetch_image(source.url, max_bytes=remaining,
 +                                  deadline=min(deadline, time.monotonic() + limits.timeout_seconds),
-+                                  max_redirects=limits.max_redirects, max_url_chars=limits.max_url_chars,
-+                                  media_types=VIDEO_MEDIA_TYPES)
-+        else:
-+            raise ImageInputError("video URLs are off on this server")
-+        total += len(data)
-+        output.append(decode_video(data, size, limits, deadline))
++                                  max_redirects=limits.max_redirects, max_url_chars=limits.max_url_chars)
++        total_bytes += len(data)
++        decoded = _decode(data, source.detail, limits, limits.max_total_pixels - total_pixels)
++        if time.monotonic() >= deadline:
++            raise ImageInputError("image request exceeds the total time limit")
++        total_pixels += decoded.width * decoded.height
++        output.append(decoded)
 +    return output

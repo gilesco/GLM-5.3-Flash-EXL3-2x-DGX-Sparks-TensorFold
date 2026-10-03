@@ -1,8 +1,8 @@
 diff --git tensorfold/cuda/kernels/qmm.cu tensorfold/cuda/kernels/qmm.cu
-index c759255..5aa20ae 100644
+index 0d9c959..e740e6c 100644
 --- tensorfold/cuda/kernels/qmm.cu
 +++ tensorfold/cuda/kernels/qmm.cu
-@@ -56,9 +56,15 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
+@@ -39,9 +39,15 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
          unsigned char* pw = p + T::X;
          constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
          for (int c = tid; c < T::W / 16; c += T::THREADS) {
@@ -21,7 +21,7 @@ index c759255..5aa20ae 100644
          }
          unsigned char* ps = pw + T::W;
          for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
-@@ -310,7 +316,11 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
+@@ -293,7 +299,11 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
          case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
          case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
          case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
@@ -34,11 +34,72 @@ index c759255..5aa20ae 100644
      }
  }
  
+diff --git tensorfold/cuda/kernels/qmm.cu.orig tensorfold/cuda/kernels/qmm.cu.orig
+index aae3c08..0d9c959 100644
+--- tensorfold/cuda/kernels/qmm.cu.orig
++++ tensorfold/cuda/kernels/qmm.cu.orig
+@@ -297,6 +297,28 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
+     }
+ }
+ 
++// Decode rows (a 16-row tile) on other column tiles, warps and stage counts: every output's chain (groups in order
++// within its K slice, slices added in order) is qmm_kernel's, so every choice gives the same bits.
++template <bool F32, bool CLUSTER>
++void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& s,
++                  const at::Tensor& b, at::Tensor& out, const at::Tensor& part, int N, int SK) {
++    switch (cfg) {
++        case 0: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 1: launch<64, 16, 128, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 2: launch<64, 16, 128, 1, 8, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 3: launch<64, 16, 64, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 4: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 5: launch<64, 16, 64, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 6: launch<64, 16, 128, 1, 8, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 7: launch<64, 16, 64, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 8: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
++        case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
++        case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-11");
++    }
++}
++
+ } // namespace
+ 
+ // Clusters hold up to 8 K slices (the portable size) from sm_90; more, unreduced slices or older GPUs use the buffer.
+@@ -325,6 +347,27 @@ void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w
+     }
+ }
+ 
++// ``qmm_cuda`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg``.
++void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
++                  const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, bool f32, int cfg) {
++    const int M = x.size(0);
++    TORCH_CHECK(M <= 16, "qmm_cfg: decode rows (up to 16)");
++    const bool cluster = qmm_clusters(SK, true);
++    if (f32) { if (cluster) dispatch_cfg<true, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
++               else dispatch_cfg<true, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
++    else { if (cluster) dispatch_cfg<false, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
++           else dispatch_cfg<false, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
++    if (SK > 1 && !cluster) {
++        const long long total = static_cast<long long>(M) * N;
++        const int threads = 256;
++        const int blocks = static_cast<int>((total + threads - 1) / threads);
++        auto stream = at::cuda::getCurrentCUDAStream();
++        if (f32) reduce_kernel<true><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
++        else reduce_kernel<false><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++}
++
+ void qmm_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+               const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, int gs, int bm,
+               bool f32, bool reduce) {
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index c1fb8ce..adec331 100644
+index 52b70c7..07b411c 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -433,7 +433,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+@@ -435,7 +435,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
                  glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
                  mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
              with prof.timed("moe: combine"):
@@ -49,6 +110,19 @@ index c1fb8ce..adec331 100644
                      glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
                  else:
                      b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 1af99f7..52b70c7 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -287,7 +287,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+     with prof.timed("kda: recurrence"):
+         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+                             k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
+-                            st.rec[1 - cur, li])
++                            st.rec[1 - cur, li], pos=st.pos if pre else None)
+     if pre:                              # a prompt chunk keeps every row: the layer commits now
+         st.cur[li] = 1 - cur
+         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
 diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
 index 620025a..ae13bb7 100644
 --- tensorfold/families/glm5_next/cuda/glue.py

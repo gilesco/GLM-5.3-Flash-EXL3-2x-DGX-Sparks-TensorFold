@@ -349,7 +349,7 @@ index e018386..b14a7e9 100644
 -                        m_rows[:len(m_next)])
 +                        m_rows[:len(m_next)], c_rounds, c_drafted, c_accepted)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 53ddda9..62a1117 100644
+index 2608819..70752a0 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -141,6 +141,11 @@ class GlmEngine:
@@ -411,12 +411,10 @@ index 53ddda9..62a1117 100644
          # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
          if feed is None:
              self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
-@@ -545,6 +555,10 @@ class GlmEngine:
-                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
-         if res.arms:
+@@ -547,6 +557,8 @@ class GlmEngine:
              stats.update(drafters=res.arms, keeps=res.keeps)
-+        if policy is not None:
-+            stats.update(drafted=res.drafted, accepted=res.accepted)
+         if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report
+             stats.update(drafted=res.drafted, accepted=res.accepted)
 +        if copies is not None:
 +            stats.update(copy_rounds=res.copy_rounds, copy_drafted=res.copy_drafted, copy_accepted=res.copy_accepted)
          if res.stages:

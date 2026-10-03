@@ -18,7 +18,7 @@ index d355e85..1e6d712 100644
              self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
              self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 7aa889c..96ee202 100644
+index 3bb612a..83956bd 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -694,6 +694,9 @@ class GlmEngine:
@@ -32,10 +32,10 @@ index 7aa889c..96ee202 100644
          if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
              print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 1af69e5..4d6499e 100644
+index 9669ea9..7c57a71 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -35,7 +35,7 @@ def prompt_split_k(w: Weights) -> bool:
+@@ -37,7 +37,7 @@ def prompt_split_k(w: Weights) -> bool:
  class Buffers:
      """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
  
@@ -44,7 +44,7 @@ index 1af69e5..4d6499e 100644
          c = w.cfg
          dev = w.device
          bf, f32 = torch.bfloat16, torch.float32
-@@ -43,6 +43,9 @@ class Buffers:
+@@ -45,6 +45,9 @@ class Buffers:
          HL = tp.of(w).heads
          LL = tp.of(w).lin_heads
          self.rows, self.prefill = rows, prefill
@@ -54,7 +54,7 @@ index 1af69e5..4d6499e 100644
          head_rows = 1 if prefill else rows
          self.world = w.world
          self.ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
-@@ -151,7 +154,8 @@ class Buffers:
+@@ -153,7 +156,8 @@ class Buffers:
          self.tap_at = {}
          for i, layer in enumerate(layers):
              self.tap_at.setdefault(layer, []).append(i)
@@ -64,6 +64,154 @@ index 1af69e5..4d6499e 100644
  
      def parents(self, R: int) -> torch.Tensor:
          p = self._parents.get(R)
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 60b3a3a..9669ea9 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -14,7 +14,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
++from . import exl3_generic, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -42,8 +42,8 @@ class Buffers:
+         dev = w.device
+         bf, f32 = torch.bfloat16, torch.float32
+         D, S = c.hidden, c.streams
+-        HL = c.heads // w.world
+-        LL = c.lin_heads // w.world
++        HL = tp.of(w).heads
++        LL = tp.of(w).lin_heads
+         self.rows, self.prefill = rows, prefill
+         head_rows = 1 if prefill else rows
+         self.world = w.world
+@@ -95,13 +95,13 @@ class Buffers:
+         self.igr = torch.empty((rows, c.index_dim), dtype=f32, device=dev)
+         self.qi = torch.empty((rows, c.index_heads * c.index_dim), dtype=bf, device=dev)
+         # dense MLP
+-        dl = c.dense_width // w.world
++        dl = tp.of(w).dense
+         self.gu = torch.empty((rows, 2 * dl), dtype=bf, device=dev)
+         self.act = torch.empty((rows, dl), dtype=bf, device=dev)
+         self.xs_act = torch.empty((rows, dl // 64), dtype=f32, device=dev)
+         # MoE
+         slots = c.top_k + 1
+-        ml = c.moe_width // w.world
++        ml = tp.of(w).moe
+         self.mlog = torch.empty((rows, c.experts), dtype=f32, device=dev)
+         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=dev)
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
+@@ -114,7 +114,7 @@ class Buffers:
+             from .exl3_mm import Scratch, prompt_kernels, prompt_pass
+ 
+             prompt = prefill and prompt_kernels()
+-            sl = c.shared_width // w.world
++            sl = tp.of(w).shared
+             self.exl3 = Scratch(rows, slots, D, ml, dev, prompt=prompt)
+             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
+             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
+@@ -189,7 +189,7 @@ class Caches:
+ 
+         c = w.cfg
+         dev = w.device
+-        HL = c.heads // w.world
++        HL = tp.of(w).heads
+         dsa = len([l for l in w.layers if l.kind == "dsa"])
+         self.latent = latent.ENABLED
+         if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
+@@ -278,7 +278,7 @@ class Slots:
+     def __init__(self, w: Weights, count: int, rows: int) -> None:
+         c = w.cfg
+         dev = w.device
+-        LL = c.lin_heads // w.world
++        LL = tp.of(w).lin_heads
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         n = len(kda_layers)
+         width = kda_layers[0].kda.proj.n if kda_layers else 0
+@@ -300,7 +300,7 @@ def slot_bytes(w: Weights, rows: int) -> int:
+     """Device bytes one more stream slot takes (``Slots``), without allocating it."""
+ 
+     c = w.cfg
+-    LL = c.lin_heads // w.world
++    LL = tp.of(w).lin_heads
+     kda_layers = [l for l in w.layers if l.kind == "kda"]
+     n = len(kda_layers)
+     width = kda_layers[0].kda.proj.n if kda_layers else 0
+@@ -865,8 +865,8 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+ 
+ 
+-def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+-                 mixer=None) -> None:
++def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
++                      mixer=None):
+     """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
+     (``hcsplit``): the first hc_pre runs on every row as unsplit, each later one on this rank's rows, and b.normed,
+     the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean.
+@@ -899,10 +899,60 @@ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, hos
+                 sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
+                         taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front)
+             done = sp.own() if front is not None else None
++            yield layer.index
+     finally:
+         sp.finish()
+ 
+ 
++def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
++                 mixer=None) -> None:
++    for _ in split_layer_steps(w, st, b, R, nch, host_pos, mixer):
++        pass
++
++
++def compute_steps(w: Weights, st: State, b: Buffers, R: int, *, nch: int | None = None,
++                  host_pos: int | None = None, inject=None, head: bool = True, mixer=None):
++    """Prompt-only forward yielding after each complete layer; returns the head on exhaustion.
++
++    All live rows, taps and overlapped fronts stay in the engine's dedicated pbuf. A split boundary retains
++    only this rank's hidden rows plus the already prepared next front, exactly as the uninterrupted split loop.
++    The scheduler drains CUDA before a decode round; verify never borrows pbuf. KDA's global temporary scratch
++    is consumed inside a layer, so nothing in it needs to survive this yield.
++    """
++    if not b.prefill:
++        raise ValueError("layer-sliced forwards require prompt buffers")
++    c = w.cfg
++    glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    if inject is not None:
++        rows, features = inject
++        b.x.index_copy_(0, rows, features.repeat(1, c.streams))
++    split = b.split is not None and b.split.applies(R)
++    if split:
++        steps = split_layer_steps(w, st, b, R, nch, host_pos, mixer)
++        try:
++            for i in steps:
++                b.split.finish()                    # main stream joins the overlap exchanges/fronts
++                yield i
++                # A decode round may have used the main stream since the last yield. Geometry and prompt
++                # buffers remain intact; the overlap stream must join the new main-stream work before reuse.
++                if b.split.stream is not None:
++                    b.split.stream.wait_stream(torch.cuda.current_stream())
++                b.split.active = True
++        finally:
++            steps.close()
++    else:
++        for layer in w.layers:
++            layer_forward(layer, w, st, b, R, nch, host_pos, None, mixer)
++            for slot in b.tap_at.get(layer.index, ()):
++                glue.stream_mean(b.x[:R], b.taps[slot][:R])
++            yield layer.index
++        glue.stream_mean(b.x[:R], b.hidden[:R])
++    glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if head:
++        return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
++    return None
++
++
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+     pos = st.pos if pos is None else pos
+     if pos + R > w.cfg.dense_limit and st.index is None:
 diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
 index 7a44e73..3c14726 100644
 --- tensorfold/families/glm5_next/cuda/hcsplit.py

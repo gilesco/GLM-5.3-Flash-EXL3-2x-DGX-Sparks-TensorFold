@@ -1,9 +1,9 @@
 diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
-index 7abbd21..0306412 100644
+index 3ba0bba..11b2ece 100644
 --- tensorfold/cuda/geometry.py
 +++ tensorfold/cuda/geometry.py
-@@ -220,16 +220,26 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
-             + 12 * streams + 64)
+@@ -245,16 +245,26 @@ def indexed_prompt_bytes(t: dict, rows: int, world: int = 1) -> int:
+     return rows * _indexed_prefill_row(t, world, h, hk, hd, nv, dv, width, slots, moe)
  
  
 -def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
@@ -34,7 +34,7 @@ index 7abbd21..0306412 100644
      linear, attention = layer_counts(t)
      lin = t.get("linear_attn_config") or {}
      heads = int(t["num_attention_heads"]) // world
-@@ -252,15 +262,18 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+@@ -277,15 +287,18 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
      # prompt-chunk buffers: at most 5 row extents a row without the head
      fixed += prefill_rows * 5 * (extent - int(t["vocab_size"]) // world)
      if (t.get("_quantization") or {}).get("quant_method") == "exl3":
@@ -58,7 +58,7 @@ index 7abbd21..0306412 100644
              cache = count * capacity * lw * 2
              dense = min(capacity, minimum_slots) + prefill_rows
              scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
-@@ -273,12 +286,16 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+@@ -298,12 +311,16 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
      return Geometry(bytes_at, reserve, minimum_slots)
  
  
@@ -77,8 +77,29 @@ index 7abbd21..0306412 100644
      if latent:
          return select + ((topk + 515) // 512) * prefill_rows * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
      kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+diff --git tensorfold/cuda/geometry.py.orig tensorfold/cuda/geometry.py.orig
+index 7f8b46f..3ba0bba 100644
+--- tensorfold/cuda/geometry.py.orig
++++ tensorfold/cuda/geometry.py.orig
+@@ -10,6 +10,7 @@ from .capacity import Geometry, Weights, headers, itemsize
+ PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
+ PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
+ PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
++MLA_DECODE_ROWS = 64    # GLM's decode windows the MLA estimate sizes buffers for (its verify windows: at most this)
+ MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
+ MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
+ 
+@@ -263,7 +264,7 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
+     mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
+-    rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 4))
++    rows, d, streams = MLA_DECODE_ROWS, int(t["hidden_size"]), int(t.get("hc_mult", 4))
+     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
+     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
+     fixed += linear * rows * lh * (12 * ld + 4)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index e37584a..1a65d1c 100644
+index e52e118..bc3c677 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -372,11 +372,15 @@ class GlmEngine:
@@ -99,10 +120,10 @@ index e37584a..1a65d1c 100644
          self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                     geometry,
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index a5bf941..f09d0dd 100644
+index 5e2fdd9..9fcb76a 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -17,6 +17,21 @@ from .attention import AttnScratch, attention, kv_write
+@@ -19,6 +19,21 @@ from .attention import AttnScratch, attention, kv_write
  from .weights import LayerW, Weights
  
  
@@ -124,7 +145,7 @@ index a5bf941..f09d0dd 100644
  class Buffers:
      """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
  
-@@ -36,9 +51,12 @@ class Buffers:
+@@ -38,9 +53,12 @@ class Buffers:
          if latent.ENABLED:
              # Dense attention only ever covers contexts up to the dense limit; longer rows go sparse.
              self.attn = None
@@ -138,7 +159,7 @@ index a5bf941..f09d0dd 100644
          else:
              self.attn = AttnScratch(1 if prefill else rows, HL, c.qk_dim, capacity, dev)
          if prefill:
-@@ -106,7 +124,10 @@ class Buffers:
+@@ -108,7 +126,10 @@ class Buffers:
          # rank partials
          self.part = torch.empty((rows, D), dtype=f32, device=dev)
          self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
@@ -150,7 +171,7 @@ index a5bf941..f09d0dd 100644
          # final
          self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
          self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
-@@ -344,19 +365,22 @@ def dense_rows(c, R: int, host_pos: int | None) -> int:
+@@ -346,19 +367,22 @@ def dense_rows(c, R: int, host_pos: int | None) -> int:
      return min(R, max(0, sparse.SPARSE_FROM - host_pos))
  
  
@@ -181,7 +202,7 @@ index a5bf941..f09d0dd 100644
      return out
  
  
-@@ -389,7 +413,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+@@ -391,7 +415,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
          dense = dense_rows(c, R, host_pos) if sparse_rows else R
          with prof.timed("dsa: dense attention"):
              dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
@@ -190,6 +211,57 @@ index a5bf941..f09d0dd 100644
      if sparse_rows:
          with prof.timed("dsa: select tokens"):
              mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 07b411c..5e2fdd9 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -614,6 +614,46 @@ def _shift_conv(conv: torch.Tensor, proj: torch.Tensor, keep: int) -> None:
+                                            TAPS=taps, BLOCK=1024, num_warps=4)
+ 
+ 
++@triton.jit
++def _conv_shift_seg(CONV, PROJ, SEG, conv_slot, conv_layer, proj_layer, proj_row, C: tl.constexpr,
++                    TAPS: tl.constexpr, COLS: tl.constexpr, BLOCK: tl.constexpr):
++    """Program (layer, channel block, segment): ``_conv_shift`` of the segment's conv slot over its own rows."""
++
++    l = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    e = SEG + tl.program_id(2) * COLS
++    row0 = tl.load(e + 0).to(tl.int64)
++    rows = tl.load(e + 1)
++    cslot = tl.load(e + 4).to(tl.int64)
++    keep = tl.load(e + 5)
++    if rows > 0:
++        conv = CONV + cslot * conv_slot
++        proj = PROJ + row0 * proj_row
++        v0 = _row(conv, proj, l, keep, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        v1 = _row(conv, proj, l, keep + 1, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        v2 = _row(conv, proj, l, keep + 2, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        tl.store(conv + l * conv_layer + c, v0, mask=c < C)
++        tl.store(conv + l * conv_layer + C + c, v1, mask=c < C)
++        tl.store(conv + l * conv_layer + 2 * C + c, v2, mask=c < C)
++
++
++def conv_shift_segments(conv: torch.Tensor, proj: torch.Tensor, seg: torch.Tensor) -> None:
++    """``_shift_conv`` per segment of a multi-stream window: conv [conv slots, L, 3, C] (in place; each [3, C]
++    contiguous), proj [L, R, W >= C] the window's projection rows; segment i (``kda.segment_table``) has its conv
++    slot take rows keep .. keep + 2 of [conv[slot]; its own proj rows]. Segments of 0 rows are skipped."""
++
++    _, n, taps, C = conv.shape
++    if taps != 3:
++        raise ValueError("the conv shift kernel is written for 4-tap convolutions")
++    if conv.stride(3) != 1 or conv.stride(2) != C:
++        raise ValueError("each conv slot's [3, C] window must be contiguous")
++    if seg.dtype != torch.int32 or seg.dim() != 2 or seg.shape[1] != kda_mod.SEG_COLS or not seg.is_contiguous():
++        raise ValueError("segments: a contiguous int32 [nseg, SEG_COLS] table")
++    _conv_shift_seg[(n, triton.cdiv(C, 1024), seg.shape[0])](
++        conv, proj, seg, conv.stride(0), conv.stride(1), proj.stride(0), proj.stride(1), C=C, TAPS=taps,
++        COLS=kda_mod.SEG_COLS, BLOCK=1024, num_warps=4)
++
++
+ @torch.no_grad()
+ def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
+     """Keep the last forward's first ``keep`` rows; a prompt chunk keeps all, its KDA layers already committed."""
 diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
 index cfe50b3..3026586 100644
 --- tensorfold/families/glm5_next/cuda/latent.py

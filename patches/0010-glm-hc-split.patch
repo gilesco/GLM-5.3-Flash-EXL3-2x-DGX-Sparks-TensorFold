@@ -1,5 +1,5 @@
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
-index 2e50cdc..b94a2ce 100644
+index 8e897be..2b8efe8 100644
 --- tensorfold/cuda/comm.py
 +++ tensorfold/cuda/comm.py
 @@ -1,4 +1,5 @@
@@ -9,44 +9,6 @@ index 2e50cdc..b94a2ce 100644
  
  from __future__ import annotations
  
-@@ -47,6 +48,11 @@ class NCCL:
-         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
-         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
-                                       ctypes.c_void_p]
-+        for name in ("ncclSend", "ncclRecv"):
-+            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-+                                           ctypes.c_void_p, ctypes.c_void_p]
-+        lib.ncclGroupStart.argtypes = []
-+        lib.ncclGroupEnd.argtypes = []
-         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
-         uid = _UniqueId()
-         if rank == 0:
-@@ -97,6 +103,25 @@ class NCCL:
-             print(f"[tensorfold] rank {self.rank} finished {label}; waiting for rank {missing} ({waited:.0f} s)",
-                   flush=True)
- 
-+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
-+        """One NCCL group on the current stream: every ``sends[i]`` to ``peer`` and ``recvs[i]`` from it (contiguous
-+        tensors; the peer's matching call has the same count, sizes and dtypes in the same order)."""
-+
-+        if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
-+            raise ValueError("exchange: one receive per send, from another rank")
-+        for s, r in zip(sends, recvs):
-+            if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
-+                raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
-+        stream = torch.cuda.current_stream().cuda_stream
-+        self._check(self.lib.ncclGroupStart())
-+        try:
-+            for s, r in zip(sends, recvs):
-+                if s.numel():
-+                    self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
-+                    self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
-+        finally:
-+            self._check(self.lib.ncclGroupEnd())
-+
-     def barrier(self) -> None:
-         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
-         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
 diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
 index b16ad04..c75f90c 100644
 --- tensorfold/families/glm5_next/cuda/decode.py
@@ -75,7 +37,7 @@ index b16ad04..c75f90c 100644
          self.st = State(w, capacity, max_rows)
          self.last_hidden: torch.Tensor | None = None
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index b508ba0..3c2b10e 100644
+index 37f4679..11686a6 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -160,9 +160,11 @@ class GlmEngine:
@@ -138,10 +100,10 @@ index b508ba0..3c2b10e 100644
              print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
                    f"(TF_GLM_PROMPT_GRID)", flush=True)
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index a961a94..98ed9e6 100644
+index 2ff7b6d..1af99f7 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -123,6 +123,8 @@ class Buffers:
+@@ -125,6 +125,8 @@ class Buffers:
          self.tap_at: dict[int, list[int]] = {}
          self.experts = c.experts
          self.top_k = c.top_k
@@ -150,7 +112,7 @@ index a961a94..98ed9e6 100644
  
      def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
          self.tap_at = {}
-@@ -244,9 +246,27 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+@@ -246,9 +248,27 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
      return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
  
  
@@ -181,8 +143,8 @@ index a961a94..98ed9e6 100644
  
  
  def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
-@@ -406,26 +426,48 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
-         with prof.timed("moe: routed (exl3)"):
+@@ -408,26 +428,48 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ 
              exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
          s = m.shared
 -        with prof.timed("moe: shared expert"):
@@ -246,7 +208,7 @@ index a961a94..98ed9e6 100644
  
  
  def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-@@ -435,24 +477,43 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+@@ -437,24 +479,43 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
      h = layer.attn_hc
      glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                  b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
@@ -300,7 +262,7 @@ index a961a94..98ed9e6 100644
  def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
      pos = st.pos if pos is None else pos
      if pos + R > w.cfg.dense_limit and st.index is None:
-@@ -485,11 +546,14 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+@@ -487,11 +548,14 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
      if inject is not None:
          rows, features = inject
          b.x.index_copy_(0, rows, features.repeat(1, c.streams))

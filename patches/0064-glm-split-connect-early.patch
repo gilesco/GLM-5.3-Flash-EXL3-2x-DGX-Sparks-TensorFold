@@ -1,8 +1,5 @@
-# TF_GLM_HC_SPLIT=1: the split's send/receive connection opens before the weights and the cache pool, so NCCL's
-# buffer registration no longer fails with ENOMEM on some Spark pairs (issue #36). MiaAI-Lab, Apache-2.0.
-
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index e4170a4..87f265f 100644
+index 89fec6a..7e77d11 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -590,6 +590,14 @@ class GlmEngine:

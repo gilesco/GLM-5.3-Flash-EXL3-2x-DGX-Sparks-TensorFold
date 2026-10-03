@@ -1,12 +1,8 @@
-# A stopped serial request (PARALLEL=1: client gone, stop string, a gate) ends on every rank within a round: rank 0's
-# stop rides on the round's sample all-gather; --parallel N>1 without DFlash2 refused up front (issue #38). MiaAI-Lab,
-# Apache-2.0.
-
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index 70a5c34..ee97e62 100644
+index 3cf6188..d746ea7 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -437,7 +437,8 @@ class App:
+@@ -491,7 +491,8 @@ class App:
              return delta, raw
  
          def on_tokens(new: list[int]) -> bool:
@@ -16,6 +12,20 @@ index 70a5c34..ee97e62 100644
              if playout is not None and playout.gone:
                  stopped["client"] = True
              if stopped["client"] or stopped["stop"] or failed:
+diff --git tensorfold/cuda/server.py.orig tensorfold/cuda/server.py.orig
+index 7734db1..3cf6188 100644
+--- tensorfold/cuda/server.py.orig
++++ tensorfold/cuda/server.py.orig
+@@ -594,6 +594,9 @@ class App:
+                     from tensorfold.vision.qwen_processing import continued
+ 
+                     extra["vision"] = continued(prepared.vision, ids, self.vision.frontend.config)
++            # generate_gated wraps on_tokens: attach the poll to the actual callback
++            # reaching the scheduler, without invoking its streaming/pacing state.
++            feed.cancelled = cancelled
+             stats = self.engine.generate(ids, count, sampling, feed, **extra)
+             if not cached:
+                 cached.append(int((stats or {}).get("cached") or 0))
 diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
 index 40aa44e..eeb54be 100644
 --- tensorfold/families/glm5_next/cuda/decode.py
@@ -223,7 +233,7 @@ index 01ad045..4652da5 100644
          t0 = time.perf_counter()
          copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 64549a8..be14353 100644
+index acdff99..c8685f5 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -493,6 +493,13 @@ class GlmEngine:
@@ -279,4 +289,125 @@ index 64549a8..be14353 100644
 +            stats["stopped"] = True
          if res.arms:
              stats.update(drafters=res.arms, keeps=res.keeps)
-         if policy is not None:
+         if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report
+diff --git tensorfold/families/glm5_next/cuda/engine.py.orig tensorfold/families/glm5_next/cuda/engine.py.orig
+index ef03702..acdff99 100644
+--- tensorfold/families/glm5_next/cuda/engine.py.orig
++++ tensorfold/families/glm5_next/cuda/engine.py.orig
+@@ -304,10 +304,37 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+     return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
+ 
+ 
+-PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
++PARALLEL_MOST = 8                     # --parallel: concurrent requests at most (segments.MAX_SEGS: a window's streams)
+ MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+ 
+ 
++def multi_window(value: str | None = None) -> int:
++    """TF_GLM_MULTI_WINDOW: --parallel's shared verify window, the rows of every stream's windows together in a round
++    (the longest tails trimmed past it): 32 (default) or 16 to 64 in steps of 8 (``geometry.MLA_DECODE_ROWS``: the
++    widest decode window the kernels serve). The batched window's buffers, token selection scratch and CUDA graphs (one
++    a row count) are sized for it, and the startup estimate counts them. Past 32 rows a round's all-gathers exceed
++    TF_ROCE_MAX_KB=512 (16 KiB a row) and go through NCCL unless it is raised (1024 for 64 rows)."""
++
++    from tensorfold.cuda.geometry import MLA_DECODE_ROWS
++
++    value = (os.environ.get("TF_GLM_MULTI_WINDOW", "") if value is None else value).strip()
++    if value == "":
++        return MULTI_WINDOW
++    if not value.isdecimal() or not 16 <= int(value) <= MLA_DECODE_ROWS or int(value) % 8:
++        raise ValueError(f"TF_GLM_MULTI_WINDOW: 16 to {MLA_DECODE_ROWS} rows in steps of 8, not {value!r}")
++    return int(value)
++
++
++def multi_decode_rows(parallel: int, window: int, rows: int = MAX_ROWS) -> int:
++    """Decode-window rows the startup estimate sizes buffers for: MLA_DECODE_ROWS, or under --parallel the engine's own
++    window (``rows``: TF_GLM_MAX_ROWS, a lone stream's) and the batched one (``window``) together when they take more
++    (TF_GLM_MULTI_WINDOW past 48 at the default 16 rows; 16 + 32 = 48 fit the 64 rows as ever)."""
++
++    from tensorfold.cuda.geometry import MLA_DECODE_ROWS
++
++    return max(MLA_DECODE_ROWS, int(rows) + int(window)) if parallel > 1 else MLA_DECODE_ROWS
++
++
+ def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
+     """What one more stream slot (``forward.Slots``) takes on rank ``rank`` of ``world``, from the text config:
+     every KDA layer's recurrent states (two parities), conv window, a decode window's projections and replay
+@@ -343,8 +370,19 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
+     window = int(t.get("sliding_window", 0))
+     ring_rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
+     cap = ring_rows if 0 < ring_rows < capacity + block else capacity + block
+-    trash = -(-max(64, streams * tap_rows) // block) * block
+-    return 2 * layers * heads * hd * (streams * cap + trash) * 2
++
++    def update_rows(n: int) -> int:                 # a context update's rows (MultiDrafter.t_max): the trash
++        return -(-max(64, n * tap_rows) // block) * block
++
++    trash = update_rows(streams)
++    # past four streams (whose blocks and updates the drafter's own 64-row estimate covers): the batched block pass's
++    # activations (dflash2_geometry's 16 fp32 values a row and width) and the context update's tap rows grow too
++    four = min(streams, 4)
++    hidden, inter = int(t.get("hidden_size", 0)), int(t.get("intermediate_size", 0))
++    taps = len((t.get("dflash_config") or {}).get("target_layer_ids") or ()) or 5
++    passes = (16 * (max(64, streams * block) - max(64, four * block)) * (hidden + inter) * 4
++              + (trash - update_rows(four)) * taps * hidden * 2)
++    return 2 * layers * heads * hd * (streams * cap + trash) * 2 + passes
+ 
+ 
+ def draft_fraction(draft_dir, rank: int, world: int):
+@@ -462,6 +500,8 @@ class GlmEngine:
+         if not 1 <= parallel <= PARALLEL_MOST:
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+         self.parallel = parallel
++        # TF_GLM_MULTI_WINDOW: the rows of a round's shared verify window (--parallel), read on every rank (compared below)
++        self.multi_window = multi_window()
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+         self.comm = comm if comm is not None else open_comm(rank, world, master, port)
+@@ -561,12 +601,14 @@ class GlmEngine:
+             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prompt_buffer_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+-                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
++                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv,
++                             decode_rows=multi_decode_rows(parallel, self.multi_window))
+             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
+-            # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
+-            # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
++            # verify window's buffers (TF_GLM_MULTI_WINDOW rows) beside the engine's own fit the decode rows the
++            # estimate sizes (``multi_decode_rows``), its token selection's fp32 scores (window rows x a pool of 4
++            # tokens) grow with the pool
+             extra = workspace + (parallel - 1) * (slot_bytes(text, world, rank=rank) + mla_ring_bytes(text, prefill_rows))
+-            per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
++            per = 4 * self.multi_window // 4 if parallel > 1 else 0
+             if not extra and not per:
+                 return g
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+@@ -607,7 +649,7 @@ class GlmEngine:
+ 
+             from .sliced_fill import budget_ms
+ 
+-            verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
++            verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms()) + [self.multi_window]
+         else:
+             verify_code = [verify_code]
+         # every rank must run the same calls: refuse to start when they were given different settings
+@@ -628,7 +670,7 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+-                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
++                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+@@ -770,7 +812,8 @@ class GlmEngine:
+                 self.scheduler = GlmScheduler(self.multi, max_streams=parallel)
+                 self.concurrent = True
+                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
+-                      f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
++                      f"in one pool of {pool_rows} tokens (each up to {self.limit}), their verify windows "
++                      f"{self.multi.window} rows together (TF_GLM_MULTI_WINDOW); DFlash2 drafts, prompt chunks of "
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                       f"{self.multi.tune.describe()}"

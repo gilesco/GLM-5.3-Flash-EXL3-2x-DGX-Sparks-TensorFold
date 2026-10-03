@@ -1,7 +1,3 @@
-# Issue #11: image prompts resume from kept prompt states under --parallel (keyed by each picture's content).
-# Contributed by @abhicnv007 (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#11), applied unchanged,
-# with two review changes by MiaAI-Lab. Apache-2.0.
-
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
 index c0c7dcf..9c66222 100644
 --- tensorfold/families/glm5_next/cuda/multi.py

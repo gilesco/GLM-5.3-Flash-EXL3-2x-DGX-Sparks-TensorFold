@@ -19,7 +19,7 @@ index 1e6d712..40aa44e 100644
          if taps:
              self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 96ee202..a6332ba 100644
+index 83956bd..ef03702 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -548,12 +548,18 @@ class GlmEngine:

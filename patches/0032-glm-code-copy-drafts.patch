@@ -166,7 +166,7 @@ index 3aa3b25..10860da 100644
 +            return drafts
 +        return drafts + [drafts[-1]] * (width - rows)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 6b796d7..66fa9ca 100644
+index 1917b68..a8408b4 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -17,7 +17,48 @@ DEFAULT_POLICY = "auto"

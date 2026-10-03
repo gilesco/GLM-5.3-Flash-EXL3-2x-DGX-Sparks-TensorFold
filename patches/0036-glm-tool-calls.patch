@@ -1,8 +1,8 @@
 diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
-index 83f1ecc..b800c81 100644
+index be124b3..0b54683 100644
 --- tensorfold/cuda/http.py
 +++ tensorfold/cuda/http.py
-@@ -148,6 +148,8 @@ def make_handler(app: App):
+@@ -183,6 +183,8 @@ def make_handler(app: App):
                      return self._stream_error({"message": _error_message(exc), "type": "server_error"})
                  if result["final"]:
                      emit(result["final"])
@@ -250,10 +250,10 @@ index 6fa1026..2f63be4 100644
 +
  # -- chat template -------------------------------------------------------------------------
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index 3707349..8a3ab2b 100644
+index fa9509f..a95ca49 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -24,7 +24,8 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+@@ -26,7 +26,8 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
  
  from tensorfold.cuda import health
  from tensorfold.cuda.chat_template import ChatTemplate
@@ -262,8 +262,8 @@ index 3707349..8a3ab2b 100644
 +                                        hide_tool_calls, parse_tool_calls)
  from tensorfold.cuda.turns import Turns, Yield
  from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
- 
-@@ -309,23 +310,40 @@ class App:
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+@@ -408,23 +409,40 @@ class App:
          stopped = {"client": False, "stop": False}
          failed: list[Exception] = []
          stream = StreamDecoder(self.tok, ends)
@@ -312,7 +312,7 @@ index 3707349..8a3ab2b 100644
  
          serving: list[Any] = [None]
  
-@@ -346,7 +364,7 @@ class App:
+@@ -445,7 +463,7 @@ class App:
                  else:
                      out.extend(new)
                  stream.add(new)
@@ -321,7 +321,7 @@ index 3707349..8a3ab2b 100644
                  delta: dict[str, Any] = {}
                  if len(reasoning) > sent["reasoning"]:
                      delta["reasoning_content"] = reasoning[sent["reasoning"]:]
-@@ -354,10 +372,13 @@ class App:
+@@ -453,10 +471,13 @@ class App:
                  if len(answer) > sent["content"]:
                      delta["content"] = answer[sent["content"]:]
                      sent["content"] = len(answer)
@@ -338,7 +338,7 @@ index 3707349..8a3ab2b 100644
                          if not emit(call_delta):
                              stopped["client"] = True
                              break
-@@ -442,29 +463,42 @@ class App:
+@@ -541,7 +562,7 @@ class App:
          if stopped["client"]:                                        # as the Mac server: nothing more is written
              raise RequestCancelled("the client left during the reply")
          stats = {**(stats or {}), "token_sha": token_sha(out)}
@@ -347,9 +347,8 @@ index 3707349..8a3ab2b 100644
          final: dict[str, Any] = {}
          if len(reasoning) > sent["reasoning"]:
              final["reasoning_content"] = reasoning[sent["reasoning"]:]
-         text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False))
--        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
-+        raw_answer = split(text, True)[1]
+@@ -550,23 +571,36 @@ class App:
+         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
          content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
          content = policy.content(content) if tools else content
 +        call_deltas, streamed = [], 0
@@ -368,6 +367,7 @@ index 3707349..8a3ab2b 100644
 -        finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
 +        finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
 +                                                         else "length")
+         print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
          if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
              stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
          logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
@@ -379,6 +379,7 @@ index 3707349..8a3ab2b 100644
 +            streamed = xml_stream.index + 1
 +        return {"final": final, "calls": calls, "call_deltas": call_deltas, "calls_streamed": streamed,
 +                "finish": finish, "content": content, "reasoning": reasoning,
+                 "stop_sequence": matched_stop(raw_text, stops.strings),
                  **({"logprobs": logprobs} if logprobs is not None else {}),
                  "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                  "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
@@ -387,7 +388,7 @@ index 3707349..8a3ab2b 100644
  
      def _turns(self) -> Turns:
          """The engine's turns (one request at a time, background ones last), made on first use."""
-@@ -482,6 +516,14 @@ class App:
+@@ -584,6 +618,14 @@ class App:
              close += self.tok.encode("\n\n", add_special_tokens=False).ids
          return ThinkBudget(prepared.think_budget, close, think_end)
  
@@ -455,40 +456,45 @@ index bd64ae6..83497ba 100644
                      out.append(self._args(json.dumps(decode_parameter(self.value_buffer, self.value_schema), ensure_ascii=False)))
                  else:
 diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
-index 350e5b0..c776de5 100644
+index 9765883..c60b76f 100644
 --- tensorfold/families/glm5_next/cuda/app.py
 +++ tensorfold/families/glm5_next/cuda/app.py
-@@ -6,18 +6,25 @@ from pathlib import Path
+@@ -6,23 +6,28 @@ from pathlib import Path
  from typing import Any, Callable
  
  from tensorfold.cuda.server import App, PreparedRequest, RequestError
--from tensorfold.families.glm5_next.prompts import thinking_off
+-from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
 +from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
-+from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
++from tensorfold.families.glm5_next.prompts import agent_history, clear_thinking, thinking_off
+ from tensorfold.server.errors import CONTEXT_LIMIT
  
  
  class ThinkingOffTemplate:
--    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``)."""
+-    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``), with earlier
+-    turns' reasoning kept unless the request's ``chat_template_kwargs.clear_thinking`` says otherwise
+-    (``prompts.clear_thinking``)."""
 +    """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
-+    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
-+    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
-+    ``kept_reasoning.KeptReasoning``; None: off)."""
++    (``prompts.thinking_off``), an agent's history made renderable first (``prompts.agent_history``), with the
++    reasoning of tool-calling steps the client dropped put back (``kept``, ``kept_reasoning.KeptReasoning``; None:
++    off), and earlier turns' reasoning kept unless ``chat_template_kwargs.clear_thinking`` says otherwise."""
  
--    def __init__(self, inner) -> None:
-+    def __init__(self, inner, kept: KeptReasoning | None = None) -> None:
+-    def __init__(self, inner, clear: bool | None = None) -> None:
++    def __init__(self, inner, kept: KeptReasoning | None = None, clear: bool | None = None) -> None:
          self.inner = inner
          self.efforts = getattr(inner, "efforts", frozenset())
 +        self.kept = kept
+         self.clear = clear_thinking() if clear is None else clear
  
      def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
--        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
 +        if self.kept is not None:
 +            messages = self.kept.restore(messages)
+         extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
+-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
 +        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
                                   allow_images=allow_images)
          return text if enable_thinking else thinking_off(text)
  
-@@ -48,7 +55,7 @@ class GlmApp(App):
+@@ -53,7 +58,7 @@ class GlmApp(App):
          super().__init__(engine, model_dir, served, **kwargs)
          if self.vision is not None:
              media_template(self.template, Path(model_dir))
@@ -497,7 +503,7 @@ index 350e5b0..c776de5 100644
  
      def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
          """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
-@@ -76,4 +83,9 @@ class GlmApp(App):
+@@ -83,4 +88,9 @@ class GlmApp(App):
          model = str(body.get("model") or "")
          self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
          self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
@@ -670,20 +676,24 @@ index 0000000..297326c
 +                out[i] = {**m, "reasoning_content": kept}
 +        return messages if out is None else out
 diff --git tensorfold/families/glm5_next/prompts.py tensorfold/families/glm5_next/prompts.py
-index 0bf8532..8763a93 100644
+index 60b3d5f..baba788 100644
 --- tensorfold/families/glm5_next/prompts.py
 +++ tensorfold/families/glm5_next/prompts.py
-@@ -2,12 +2,59 @@
+@@ -3,9 +3,12 @@ line and no opened think block."""
  
  from __future__ import annotations
  
 +import json
+ import os
  from typing import Any
  
 +from tensorfold.server.errors import RequestError
 +
  EFFORT_LINE = "<|system|>Reasoning Effort: Max"
  OPENED = "<|assistant|><think>"
+ CLEAR_THINKING = "TF_GLM_CLEAR_THINKING"
+@@ -27,6 +30,50 @@ def clear_thinking() -> bool:
+     return value == "1"
  
  
 +def _call_id(message: Any) -> Any:
@@ -733,19 +743,126 @@ index 0bf8532..8763a93 100644
  def thinking_off(text: str) -> str:
      """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
  
-@@ -25,6 +72,7 @@ class GlmTokenizer:
+@@ -46,6 +93,7 @@ class GlmTokenizer:
          return getattr(self._inner, name)
  
      def apply_chat_template(self, messages: Any, *args: Any, tokenize: bool = True, **kwargs: Any) -> Any:
 +        messages = agent_history(messages)
+         kwargs.setdefault("clear_thinking", self._clear)
          if kwargs.get("enable_thinking", True) is not False:
              return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
-         text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
+diff --git tensorfold/families/glm5_next/prompts.py.orig tensorfold/families/glm5_next/prompts.py.orig
+new file mode 100644
+index 0000000..baba788
+--- /dev/null
++++ tensorfold/families/glm5_next/prompts.py.orig
+@@ -0,0 +1,101 @@
++"""GLM-5.3's prompts, the same on both servers: earlier turns keep their reasoning, and with thinking off no effort
++line and no opened think block."""
++
++from __future__ import annotations
++
++import json
++import os
++from typing import Any
++
++from tensorfold.server.errors import RequestError
++
++EFFORT_LINE = "<|system|>Reasoning Effort: Max"
++OPENED = "<|assistant|><think>"
++CLEAR_THINKING = "TF_GLM_CLEAR_THINKING"
++
++
++def clear_thinking() -> bool:
++    """The template's ``clear_thinking`` when a request leaves it unset: False unless ``TF_GLM_CLEAR_THINKING=1``.
++
++    zai-org's GLM-5.3-Flash template defaults it to false, keeping every assistant turn's reasoning in the prompt
++    (its model card: pass ``clear_thinking=true`` for chat). Checkpoints that carry the template's first revision
++    (``Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`` among them) clear it unless told otherwise, so the reasoning before the
++    last user message renders as ``<think></think>``: each new user message changes the earlier turns' tokens, and
++    an agent's whole previous tool loop is prefilled again. Passing false renders those checkpoints as the current
++    template does; on the current template it changes nothing."""
++
++    value = os.environ.get(CLEAR_THINKING, "0").strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"{CLEAR_THINKING}={value!r}: expected 0 or 1")
++    return value == "1"
++
++
++def _call_id(message: Any) -> Any:
++    """The id GLM's template matches a tool result or call by (its ``id_of``)."""
++
++    return message.get("tool_call_id") or message.get("id") if isinstance(message, dict) else None
++
++
++def agent_history(messages: Any) -> Any:
++    """A chat as GLM-5.3's template can render every part of it: a call's arguments sent as "" or null are no
++    arguments (the template reads them as a mapping), and results whose ids match none of their calls' ids are
++    rendered in the order sent (the template sorts results by id and silently drops one it cannot place)."""
++
++    if not isinstance(messages, list):
++        return messages
++    out = list(messages)
++    for i, message in enumerate(out):
++        calls = message.get("tool_calls") if isinstance(message, dict) and message.get("role") == "assistant" else None
++        if not isinstance(calls, list) or not calls:
++            continue
++        fixed = []
++        for j, call in enumerate(calls):
++            function = call.get("function") if isinstance(call, dict) else None
++            arguments = function.get("arguments") if isinstance(function, dict) else {}
++            if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
++                call = {**call, "function": {**function, "arguments": {}}}
++            elif isinstance(arguments, str):
++                try:
++                    parsed = json.loads(arguments)
++                except ValueError:
++                    parsed = None
++                if not isinstance(parsed, dict):
++                    raise RequestError(f"messages[{i}].tool_calls[{j}].function.arguments must be a JSON object "
++                                       f"(or empty), not {arguments[:80]!r}")
++            fixed.append(call)
++        out[i] = {**message, "tool_calls": fixed}
++        end = i + 1
++        while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
++            end += 1
++        known = {_call_id(call) for call in fixed}
++        if any(_call_id(result) and _call_id(result) not in known for result in out[i + 1:end]):
++            out[i + 1:end] = [{k: v for k, v in result.items() if k not in ("tool_call_id", "id")}
++                              for result in out[i + 1:end]]
++    return out
++
++
++def thinking_off(text: str) -> str:
++    """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
++
++    text = text.replace(EFFORT_LINE, "", 1)
++    return text + "</think>" if text.endswith(OPENED) else text
++
++
++class GlmTokenizer:
++    """The checkpoint's tokenizer (the Mac's), its chat template read through ``thinking_off`` when thinking is off
++    and given ``clear_thinking`` (``clear_thinking()``) when the call leaves it unset."""
++
++    def __init__(self, inner: Any, clear: bool | None = None) -> None:
++        self._inner = inner
++        self._clear = clear_thinking() if clear is None else clear
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._inner, name)
++
++    def apply_chat_template(self, messages: Any, *args: Any, tokenize: bool = True, **kwargs: Any) -> Any:
++        messages = agent_history(messages)
++        kwargs.setdefault("clear_thinking", self._clear)
++        if kwargs.get("enable_thinking", True) is not False:
++            return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
++        text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
++        return list(self._inner.encode(text, add_special_tokens=False)) if tokenize else text
 diff --git tensorfold/server/messages.py tensorfold/server/messages.py
-index dde2b67..2679969 100644
+index 3e9255c..313ca66 100644
 --- tensorfold/server/messages.py
 +++ tensorfold/server/messages.py
-@@ -73,6 +73,11 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
+@@ -74,6 +74,11 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
          elif not isinstance(content, str):
              raise RequestError("message content must be text or an array of text parts")
          item = message if content is message.get("content") else {**message, "content": content}

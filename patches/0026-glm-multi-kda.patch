@@ -1,8 +1,8 @@
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index adec331..a5bf941 100644
+index 07b411c..5e2fdd9 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -612,6 +612,46 @@ def _shift_conv(conv: torch.Tensor, proj: torch.Tensor, keep: int) -> None:
+@@ -614,6 +614,46 @@ def _shift_conv(conv: torch.Tensor, proj: torch.Tensor, keep: int) -> None:
                                             TAPS=taps, BLOCK=1024, num_warps=4)
  
  
@@ -49,6 +49,21 @@ index adec331..a5bf941 100644
  @torch.no_grad()
  def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
      """Keep the last forward's first ``keep`` rows; a prompt chunk keeps all, its KDA layers already committed."""
+diff --git tensorfold/families/glm5_next/cuda/forward.py.orig tensorfold/families/glm5_next/cuda/forward.py.orig
+index 52b70c7..07b411c 100644
+--- tensorfold/families/glm5_next/cuda/forward.py.orig
++++ tensorfold/families/glm5_next/cuda/forward.py.orig
+@@ -435,7 +435,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+                 glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
+                 mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
+             with prof.timed("moe: combine"):
+-                if b.prefill:            # the shared row read from sy where it is (the copy's bits, one pass less)
++                # the shared row read from sy where it is (the copy's bits, one pass less); decode windows too unless
++                # TF_GLM_COMBINE_SY=0
++                if b.prefill or __import__("os").environ.get("TF_GLM_COMBINE_SY", "1") != "0":
+                     glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+                 else:
+                     b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
 diff --git tensorfold/families/glm5_next/cuda/kda.cpp tensorfold/families/glm5_next/cuda/kda.cpp
 index 4a1315b..c40f527 100644
 --- tensorfold/families/glm5_next/cuda/kda.cpp

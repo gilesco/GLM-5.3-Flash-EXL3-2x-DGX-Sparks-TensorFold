@@ -1,26 +1,27 @@
-# PR #25: chat_template_kwargs.thinking read as enable_thinking (also {"type": "enabled"|"disabled"}).
-# Contributed by @Alexbob0 (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#25), extended by MiaAI-Lab. Apache-2.0.
-
 diff --git tensorfold/server/request_options.py tensorfold/server/request_options.py
-index ad97a21..da44c98 100644
+index 3293dba..d48df9d 100644
 --- tensorfold/server/request_options.py
 +++ tensorfold/server/request_options.py
-@@ -70,10 +70,37 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
+@@ -82,14 +82,27 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
      return coerce_effort(default if explicit is None else explicit, levels)
  
  
 +_IGNORED_THINKING: set[str] = set()     # the kinds of unread ``thinking`` values already logged (once each)
 +
 +
-+def thinking_switch(value: Any) -> bool | None:
+ def thinking_switch(value: Any) -> bool | None:
+-    """``chat_template_kwargs.thinking`` as a switch: a bool, or DeepSeek's ``{"type": "enabled" | "disabled"}``;
+-    None (the server's default) for anything else, which clients may send for their own templates."""
 +    """``chat_template_kwargs.thinking`` as ``enable_thinking``: true / false, or Anthropic's and DeepSeek's
 +    ``{"type": "enabled" | "disabled"}``. Null, and any other value (``{"type": "adaptive"}``, a string ...), is
 +    unset: the server's default, never a refusal (logged once a kind)."""
-+
+ 
 +    if value is None:
 +        return None
-+    if isinstance(value, bool):
-+        return value
+     if isinstance(value, bool):
+         return value
+-    if isinstance(value, dict) and value.get("type") in ("enabled", "disabled"):
+-        return value["type"] == "enabled"
 +    kind = value.get("type") if isinstance(value, dict) else None
 +    if kind in ("enabled", "disabled"):
 +        return kind == "enabled"
@@ -29,17 +30,73 @@ index ad97a21..da44c98 100644
 +        _IGNORED_THINKING.add(shown)
 +        print(f"[tensorfold] chat_template_kwargs.thinking {shown[:80]}: not true, false or "
 +              f'{{"type": "enabled" | "disabled"}}; the server\'s default applies (logged once)', flush=True)
-+    return None
 +
-+
- def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset()) -> dict[str, Any]:
-     """A request's ``reasoning_effort`` and ``enable_thinking`` where it sets them; unset is the server's default."""
+     return None
+ 
+ 
+@@ -100,9 +113,11 @@ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset())
+     when that is absent."""
  
      kwargs = body.get("chat_template_kwargs") or {}
+-    switch = thinking_switch(kwargs.get("thinking")) if isinstance(kwargs, dict) else None
+-    if switch is not None and "enable_thinking" not in kwargs:
+-        kwargs = {**kwargs, "enable_thinking": switch}
 +    if isinstance(kwargs, dict) and "thinking" in kwargs and "enable_thinking" not in kwargs:
 +        switch = thinking_switch(kwargs["thinking"])      # the switch DeepSeek-V4 clients (pi) send
 +        if switch is not None:
 +            kwargs = {**kwargs, "enable_thinking": switch}
++
+     fields: dict[str, Any] = {}
+     effort = body.get("reasoning_effort")
+     if effort is None and isinstance(kwargs, dict):
+diff --git tensorfold/server/request_options.py.orig tensorfold/server/request_options.py.orig
+index 3293dba..d48df9d 100644
+--- tensorfold/server/request_options.py.orig
++++ tensorfold/server/request_options.py.orig
+@@ -82,14 +82,27 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
+     return coerce_effort(default if explicit is None else explicit, levels)
+ 
+ 
++_IGNORED_THINKING: set[str] = set()     # the kinds of unread ``thinking`` values already logged (once each)
++
++
+ def thinking_switch(value: Any) -> bool | None:
+-    """``chat_template_kwargs.thinking`` as a switch: a bool, or DeepSeek's ``{"type": "enabled" | "disabled"}``;
+-    None (the server's default) for anything else, which clients may send for their own templates."""
++    """``chat_template_kwargs.thinking`` as ``enable_thinking``: true / false, or Anthropic's and DeepSeek's
++    ``{"type": "enabled" | "disabled"}``. Null, and any other value (``{"type": "adaptive"}``, a string ...), is
++    unset: the server's default, never a refusal (logged once a kind)."""
+ 
++    if value is None:
++        return None
+     if isinstance(value, bool):
+         return value
+-    if isinstance(value, dict) and value.get("type") in ("enabled", "disabled"):
+-        return value["type"] == "enabled"
++    kind = value.get("type") if isinstance(value, dict) else None
++    if kind in ("enabled", "disabled"):
++        return kind == "enabled"
++    shown = f"{{'type': {kind!r}}}" if isinstance(value, dict) else type(value).__name__
++    if shown not in _IGNORED_THINKING and len(_IGNORED_THINKING) < 64:
++        _IGNORED_THINKING.add(shown)
++        print(f"[tensorfold] chat_template_kwargs.thinking {shown[:80]}: not true, false or "
++              f'{{"type": "enabled" | "disabled"}}; the server\'s default applies (logged once)', flush=True)
++
+     return None
+ 
+ 
+@@ -100,9 +113,11 @@ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset())
+     when that is absent."""
+ 
+     kwargs = body.get("chat_template_kwargs") or {}
+-    switch = thinking_switch(kwargs.get("thinking")) if isinstance(kwargs, dict) else None
+-    if switch is not None and "enable_thinking" not in kwargs:
+-        kwargs = {**kwargs, "enable_thinking": switch}
++    if isinstance(kwargs, dict) and "thinking" in kwargs and "enable_thinking" not in kwargs:
++        switch = thinking_switch(kwargs["thinking"])      # the switch DeepSeek-V4 clients (pi) send
++        if switch is not None:
++            kwargs = {**kwargs, "enable_thinking": switch}
++
      fields: dict[str, Any] = {}
      effort = body.get("reasoning_effort")
      if effort is None and isinstance(kwargs, dict):
