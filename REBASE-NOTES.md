@@ -60,6 +60,16 @@ patch of the set. Everything before that point had worked: the image built with 
 `tensorfold_roce_v1`, `tensorfold_glm_l2pf_v2` and `tensorfold_glm_hc_v2` compiled, and both
 ranks loaded ~93 GiB of weights before the qmm build failed.
 
+## Second-start fix (2026-10-03)
+
+All seven CUDA extensions then compiled (qmm_v6 included) and both ranks loaded ~92 GiB,
+but graph capture hit `Exl3RoutedExperts has no attribute shared_suh`: upstream 8613488
+loads EXL3 experts as its universal `Exl3RoutedExperts`, while the recipe's `exl3_mm.routed`
+needs its own `Exl3Experts`. `weights.py` now builds the recipe's object exactly as the
+v0.6.0 recipe did (`exl3_words` + the 12-arg constructor); the only remaining weights.py
+delta vs production is v0.6.4's mixed-bit refusal (#226), which our uniform-4bpw checkpoint
+passes. `exl3_mm.py` is byte-identical to production's.
+
 ## Not verified here (no GPU on this box)
 
 - CUDA kernel compilation and the actual serve (start.sh does both). py_compile passed for

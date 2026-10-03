@@ -513,3 +513,48 @@ index ef03702..acdff99 100644
                        f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
                        f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
                        f"{self.multi.tune.describe()}"
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 339bcf3..0094e94 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -11,7 +11,7 @@ import torch
+ 
+ from tensorfold.cuda import experts as grouped
+ 
+-from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
++from .exl3_mm import Exl3Experts, words as exl3_words
+ from . import latent
+ from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, kvb_kind, make_b16, make_f8, make_q4, stack_b16,
+                   stack_f8, stack_q4)
+@@ -383,19 +383,18 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+         return out
+ 
+     def moe_exl3(p: str) -> Exl3Experts:
+-        from tensorfold.cuda.exl3 import experts as generic
+-        gate = generic.prepare(
+-            [(rd.get(PREFIX + p + f"experts.{e}.gate_proj.trellis").to(dev),
+-              rd.get(PREFIX + p + f"experts.{e}.gate_proj.suh").to(dev),
+-              rd.get(PREFIX + p + f"experts.{e}.gate_proj.svh").to(dev)) for e in range(cfg.experts)],
+-            [(rd.get(PREFIX + p + f"experts.{e}.up_proj.trellis").to(dev),
+-              rd.get(PREFIX + p + f"experts.{e}.up_proj.suh").to(dev),
+-              rd.get(PREFIX + p + f"experts.{e}.up_proj.svh").to(dev)) for e in range(cfg.experts)],
+-            [(rd.get(PREFIX + p + f"experts.{e}.down_proj.trellis").to(dev),
+-              rd.get(PREFIX + p + f"experts.{e}.down_proj.suh").to(dev),
+-              rd.get(PREFIX + p + f"experts.{e}.down_proj.svh").to(dev)) for e in range(cfg.experts)],
+-            "mcg", device=dev)
+-        return gate
++        parts = {}
++        for proj in ("gate_proj", "up_proj", "down_proj"):
++            ts, us, vs = [], [], []
++            for e in range(cfg.experts):
++                name = PREFIX + p + f"experts.{e}.{proj}."
++                ts.append(exl3_words(rd.get(name + "trellis")))
++                us.append(rd.get(name + "suh"))
++                vs.append(rd.get(name + "svh"))
++            parts[proj] = (torch.stack(ts).to(dev), torch.stack(us).to(dev), torch.stack(vs).to(dev))
++            del ts, us, vs
++        (gt, sg, vg), (ut, su, vu), (dt, sd, vd) = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
++        return Exl3Experts(gt, ut, dt, sg, su, vg, vu, sd, vd, cfg.experts, int(vg.shape[1]), int(vd.shape[1]))
+ 
+     def moe(i: int) -> MoEW:
+         p = f"layers.{i}.mlp."
