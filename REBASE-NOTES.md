@@ -3,7 +3,7 @@
 The 70 patches of recipe v1.5 were diffs against TensorFold **v0.6.0**'s site-packages. This
 branch rebases them onto **v0.6.4** (676de9f, 2026-10-03; 170 commits between the tags). To try it:
 
-    ./start.sh          # from this folder; scripts/local.sh already sets TF_VERSION=v0.6.4
+    ./start.sh          # from this folder; config.sh here defaults TF_VERSION to v0.6.4
 
 Revert to production: check out main (its patches target v0.6.0 and local.sh there has no
 TF_VERSION override), or just run start.sh from the production folder. Nothing here touches the

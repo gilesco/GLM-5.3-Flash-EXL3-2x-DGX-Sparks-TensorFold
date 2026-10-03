@@ -57,7 +57,7 @@ case "$MODEL_ID" in
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-TF_VERSION="${TF_VERSION:-v0.6.0}"
+TF_VERSION="${TF_VERSION:-v0.6.4}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
