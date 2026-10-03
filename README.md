@@ -17,8 +17,8 @@
 
 Serve **GLM-5.3-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through an
 OpenAI-compatible API, with **4 concurrent requests**, the model's full **1,048,576-token context** and **image and
-video input**. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 on both Sparks (one rank on each)
-in NVIDIA's PyTorch container, plus 70 patches (65 of v1.4, 3 for 3 Sparks, experimental, 1 for up to 8 requests at once, 1 for stopping serial requests): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
+video input**. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.4 on both Sparks (one rank on each)
+in NVIDIA's PyTorch container, plus 69 patches (64 of v1.4, 3 for 3 Sparks, experimental, 1 for up to 8 requests at once, 1 for stopping serial requests): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
 faster prompt kernels, a one-shot RoCE all-gather between the Sparks, several requests over one shared cache pool,
 vision, tool calling, `/tokenize` and `/metrics`.
 
@@ -228,9 +228,9 @@ the progress lines, the window retry or the smoke test; when either rank ends, i
 **`scripts/prepare.sh`** does the one-time setup, and is safe to re-run (each step skips work already done):
 
 1. Preflight on both Sparks: Docker, the GPU, `rsync`, key-based ssh, the RoCE link, disk space.
-2. The image `tensorfold-glm53:v0.6.0` on the head: TensorFold v0.6.0 with every `patches/*.patch` applied, plus PyAV
+2. The image `tensorfold-glm53:v0.6.4` on the head: TensorFold v0.6.4 with every `patches/*.patch` applied, plus PyAV
    (video decoding) and xgrammar (structured outputs), on NVIDIA's `nvcr.io/nvidia/pytorch:26.07-py3`. It first
-   pulls the published image `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-<image hash>`,
+   pulls the published image `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.4-<image hash>`,
    by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`) while the patches are this release's
    (the hash covers the patches and those pip packages); after you change `patches/`, it pulls that hash's tag if
    one is published, else (or with `PULL=0`) it builds.
@@ -246,7 +246,7 @@ PREPARE=1 ./start.sh restart   # force prepare.sh, then restart; PREPARE=0 skips
 ```
 
 After changing `patches/`, `scripts/publish-image.sh` pushes the new image to GitHub Container Registry (`latest` and
-`v0.6.0-<image hash>`, the tag `prepare.sh` looks for).
+`v0.6.4-<image hash>`, the tag `prepare.sh` looks for).
 
 ## KV pool and memory
 
@@ -306,7 +306,7 @@ exported path as the worker mounts it (default: the head's `HF_CACHE`; `/` for a
 
 `./start-tp3.sh` runs the same recipe as tensor parallel over three Sparks (`TP=3` with `./start.sh`'s options;
 `./stop.sh` stops every configured worker). **The engine for `--tp N` comes from this repo's patches 0066-0068**
-(TensorFold v0.6.0 itself serves two ranks only), in the same published image as two Sparks (`prepare.sh` pulls it on the head and copies it to every worker). **Three Sparks** were tested on v1.3.2's patches (exact against two Sparks, drafted == serial, images and
+(TensorFold v0.6.4 itself serves two ranks only), in the same published image as two Sparks (`prepare.sh` pulls it on the head and copies it to every worker). **Three Sparks** were tested on v1.3.2's patches (exact against two Sparks, drafted == serial, images and
 tool calls, concurrent requests). On top of v1.4 (2026-10-03, `KV_POOL_GIB=27`, NCCL, two boots: sliced fill on and
 off): concurrent requests equal one at a time (22/22 each boot), drafted == serial (6/6), long-prompt replies and every
 streamed reply the same with the sliced fill on and off, the 195k needle right (prefill 115.0 s), a prompt cancelled
@@ -445,7 +445,7 @@ Speed settings' measured effects: [What the patches change](#what-the-patches-ch
 changes nothing until the pin does. Set one empty to take the Hub's `main` when first downloaded.
 
 Less common settings are described in `scripts/config.sh` and `scripts/nodes.sh`: `MODEL_ID`, `DFLASH2_ID`,
-`TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for TensorFold v0.6.0; after changing any of these run
+`TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for TensorFold v0.6.4; after changing any of these run
 `scripts/prepare.sh --rebuild`), `IMAGE`, `CONTAINER_NAME`, `GHCR_IMAGE`, `HF_CACHE` (default `$HF_HOME` or
 `~/.cache/huggingface`), `KERNEL_CACHE`, `STATE_DIR`, `MIN_FREE_GB`, `IMAGE_FREE_GB`, `NCCL_RAILS` (`1`: one RoCE
 port even when the cabled port's two PCIe links, or a second port, are up), `NCCL_CHANNELS` (4), `NCCL_DEBUG`, `RSYNC_OPTS`. `start.sh` also takes `HF_HUB_OFFLINE=0` (let the
@@ -472,7 +472,7 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
 ### API notes
 
 - Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`, `/tokenize` and
-  `/detokenize` (also under `/v1/`), `/health`, and Prometheus `/metrics` (TensorFold v0.6.0's request counters,
+  `/detokenize` (also under `/v1/`), `/health`, and Prometheus `/metrics` (TensorFold's request counters,
   latency and time-to-first-token histograms, plus `/health`'s figures as `tensorfold_health:` metrics). No Anthropic
   `/v1/messages`.
 - **Context limits:** a request whose prompt plus `max_tokens` does not fit the window is refused with HTTP 400 in
@@ -499,7 +499,7 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
 
 ## What the patches change
 
-`scripts/prepare.sh` bakes every `patches/*.patch` into the image (diffs against TensorFold v0.6.0's site-packages,
+`scripts/prepare.sh` bakes every `patches/*.patch` into the image (diffs against TensorFold v0.6.4's site-packages,
 applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the image when the patches change.
 
 | Area | Patches | Change | Effect |
@@ -518,7 +518,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Drafts, tooling | `0011-glm-draft-sim` | records of DFlash2's drafts for an offline simulator of stop rules (`TF_GLM_DRAFT_DUMP`, off) | how the stop rules were tuned |
 | Concurrent requests | `0026-glm-multi-kda`, `0027-glm-multi-dflash2`, `0029-glm-multi-dsa`, `0030-glm-multi-stream-engine`, `0035-glm-multi-rounds`, `0040-glm-parallel-deadlocks`, `0041-glm-parallel-ring-base`, `0048-glm-timing-tokens`, `0049-glm-multi-prefill`, `0065-glm-rank-checks` | several streams over one shared pool of per-token caches, one batched verify window a round, both ranks kept in step; prompts that arrive together filled in one forward (`MULTI_PREFILL`: 4 prose requests at once 103.4 -> 108.8 tok/s, first token 590 -> 340 ms); a request alone on the one-stream graphs (`TF_GLM_MULTI_LONE=1`, off by default since v1.3.1: +0.6-0.9%); the startup timings of verify windows on distinct tokens | 4 requests at once ([Performance](#performance)) |
 | Sampling | `0034-cuda-nucleus-union` | a top_p draw from both ranks' candidates together, the same draw with fewer whole-shard reads (`TENSORFOLD_NUCLEUS_UNION=1`, off by default) | opt-in |
-| Server | `0003-glm-vision`, `0050-glm-many-media`, `0056-glm-tool-result-media`, `0036-glm-tool-calls`, `0051-glm-tool-history-recovery`, `0053-glm-whole-tool-calls`, `0055-glm-open-tool-calls`, `0037-cuda-tokenize`, `0023-server-effort-max`, `0057-server-thinking-alias`, `0044-cuda-context-errors`, `0045-cuda-metrics`, `0058-server-client-gone-poll`, `0059-server-refused-bodies`, `0061-server-smooth-stream` | GLM's image and video processors and vision tower; up to 50 pictures and 4 clips a request in 96 MiB bodies, in user messages and tool results; GLM tool calls for agent clients; a past tool call whose arguments are not a JSON object left out of the prompt with its result and logged, instead of HTTP 400 (agents replay history, so a 400 ended the conversation); each call sent whole once written, a call the token limit cuts never sent, one the model ends without `</tool_call>` closed when it parses (else text), a missing `<arg_key>` put back; `/tokenize` and `/detokenize`; `reasoning_effort: "max"`; `chat_template_kwargs.thinking` read as `enable_thinking` (from Alexbob0's #25); the `param` field and GLM's own refusals on TensorFold v0.6.0's `context_length_exceeded` errors, and `/health`'s figures in its Prometheus `/metrics`; the client-gone check past 1,023 descriptors (TensorFold PR #218, jayleaton); a refused POST's body read before the reply (TensorFold v0.6.1's #181 fix); smooth streaming from a playout buffer (`STREAM_SMOOTH`) | the API features above |
+| Server | `0003-glm-vision`, `0050-glm-many-media`, `0056-glm-tool-result-media`, `0036-glm-tool-calls`, `0051-glm-tool-history-recovery`, `0053-glm-whole-tool-calls`, `0055-glm-open-tool-calls`, `0037-cuda-tokenize`, `0023-server-effort-max`, `0057-server-thinking-alias`, `0044-cuda-context-errors`, `0045-cuda-metrics`, `0059-server-refused-bodies`, `0061-server-smooth-stream` | GLM's image and video processors and vision tower; up to 50 pictures and 4 clips a request in 96 MiB bodies, in user messages and tool results; GLM tool calls for agent clients; a past tool call whose arguments are not a JSON object left out of the prompt with its result and logged, instead of HTTP 400 (agents replay history, so a 400 ended the conversation); each call sent whole once written, a call the token limit cuts never sent, one the model ends without `</tool_call>` closed when it parses (else text), a missing `<arg_key>` put back; `/tokenize` and `/detokenize`; `reasoning_effort: "max"`; `chat_template_kwargs.thinking` read as `enable_thinking` (from Alexbob0's #25); the `param` field and GLM's own refusals on TensorFold v0.6.0's `context_length_exceeded` errors, and `/health`'s figures in its Prometheus `/metrics`; the client-gone check past 1,023 descriptors (TensorFold's own since v0.6.2, #218 by jayleaton); a refused POST's body read before the reply (TensorFold v0.6.1's #181 fix); smooth streaming from a playout buffer (`STREAM_SMOOTH`) | the API features above |
 | 3 Sparks (experimental) | `0066-glm-tp-n`, `0067-glm-tp3-split-pad`, `0068-glm-tpn-split-buffer-rows` | the engine on 2 or 3 ranks (`--tp`): heads, expert columns, vocabulary and DFlash2 KV groups split in whole units, the remainder to the lowest ranks; the row split (`SPLIT`) and its early connection to every peer; RoCE all-gathers over per-peer routes (b12x's proxy modified for more than two Sparks); prompt buffers and the memory estimate hold the split's pad row at three ranks | [3 Sparks](#3-sparks-experimental); two Sparks unchanged |
 | Eight requests at once | `0069-glm-eight-streams` | up to 8 concurrent requests (`PARALLEL` 1 to 8): the batched verify window's segment tables (and the segmented kernels' launch grids) sized for the streams, four as before up to four; the multi-stream DFlash2 drafter, scheduler and memory estimate for 5 to 8 streams; the shared verify window's rows set by `TF_GLM_MULTI_WINDOW` (32 as before; 64 by default past 4 requests) and counted at start | 8 at once: +27% prose, +32% code over 4 on two Sparks (+36% / +28% on three); `PARALLEL` 1 to 4 unchanged ([Performance](#performance)) |
 | Serial stop | `0070-glm-serial-stop` | at `PARALLEL=1`, a request whose client left, or that hit a stop string or a gate cut, ends on both ranks after the same round (rank 0's stop rides on the round's sample all-gather; issue #38); `--parallel` above 1 without DFlash2 refused at start with the options | same replies |
@@ -592,7 +592,7 @@ NOTICE        third-party notices (TensorFold's MIT and Apache-2.0 notices, b12x
 ## License
 
 Apache License 2.0, see [`LICENSE`](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices that go with it: the
-files in `patches/` modify TensorFold v0.6.0, and the TensorFold code they change or quote as context stays under
+files in `patches/` modify TensorFold v0.6.4, and the TensorFold code they change or quote as context stays under
 TensorFold's licenses (Apache 2.0 from v0.6.0, and the MIT notice of code written before it, both in `NOTICE`); parts
 of patches 0006 (b12x), 0036, 0046 and 0047 (glm53-tensorfold-spark) come from Apache-2.0 projects, credited there and
 in [`CREDITS.md`](CREDITS.md). The model

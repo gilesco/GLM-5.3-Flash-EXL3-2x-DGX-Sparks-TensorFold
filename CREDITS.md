@@ -34,9 +34,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   TensorFold contributors (Apache 2.0 from v0.6.0; releases up to v0.5.0 were MIT, and code written before v0.6.0
   keeps its MIT notice): the engine that serves the model, including the two-rank CUDA engine for GLM-5.3-Flash, its
   EXL3 expert kernels, DFlash2 and MTP drafting with exact verification and the OpenAI-compatible server. Every file
-  in `patches/` is a modification of TensorFold v0.6.0.
+  in `patches/` is a modification of TensorFold v0.6.4.
 - TensorFold itself builds on, and credits in its
-  [third-party notices](https://github.com/ashhart/TensorFold/blob/v0.6.0/THIRD_PARTY_NOTICES.md):
+  [third-party notices](https://github.com/ashhart/TensorFold/blob/v0.6.4/THIRD_PARTY_NOTICES.md):
   [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT), whose EXL3 format the routed experts are
   stored in, the GLM-5.3-Flash modeling code in Hugging Face
   [transformers](https://github.com/huggingface/transformers) (Apache 2.0), and

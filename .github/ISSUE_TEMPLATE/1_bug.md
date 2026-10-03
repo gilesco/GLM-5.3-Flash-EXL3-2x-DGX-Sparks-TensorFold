@@ -99,7 +99,7 @@ curl -s http://<head-address>:8888/v1/chat/completions \
           network: set FABRIC_PEER to the worker's CX7 address.
         * `start.sh` refuses port 8888 -> something else listens there; set PORT.
         * prepare.sh fails applying a patch -> TF_VERSION was changed; the patches are
-          made for v0.6.0.
+          made for v0.6.4.
         * First start takes long -> the CUDA kernels compile once on each Spark (cached in
           ~/.cache/tensorfold-glm53); that is expected, not a hang.
 -->
