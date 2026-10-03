@@ -50,6 +50,16 @@ container until start.sh runs.
 - **/v1/decisions** (#281) integrated: `follow()` reads a decision header (len 2) before the
   chat header, whose `images` and `*rest`/`SHARED_MOST` (0015) split is preserved.
 
+## First-start fix (2026-10-03)
+
+The first attempt failed compiling `tensorfold_qmm_v6`: patches 0016 and 0019 had both left a
+copy of the cfg decode-kernel set (`qmm_cfg`, `dispatch_cfg`, `qmm_cfg_cuda`) in
+`cuda/kernels/qmm.{cpp,cu}`. The final tree now carries production's single 0-15 config set
+(verified byte-equal to the v0.6.0 recipe's final kernel text); the dedupe rides in the last
+patch of the set. Everything before that point had worked: the image built with all 69 patches,
+`tensorfold_roce_v1`, `tensorfold_glm_l2pf_v2` and `tensorfold_glm_hc_v2` compiled, and both
+ranks loaded ~93 GiB of weights before the qmm build failed.
+
 ## Not verified here (no GPU on this box)
 
 - CUDA kernel compilation and the actual serve (start.sh does both). py_compile passed for

@@ -1,3 +1,105 @@
+diff --git tensorfold/cuda/kernels/qmm.cpp tensorfold/cuda/kernels/qmm.cpp
+index c76d7d3..c8ec294 100644
+--- tensorfold/cuda/kernels/qmm.cpp
++++ tensorfold/cuda/kernels/qmm.cpp
+@@ -110,36 +110,6 @@ void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, con
+                  static_cast<int>(cfg));
+ }
+ 
+-// ``qmm`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg`` (same bits, other speed).
+-void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+-             const at::Tensor& biases, at::Tensor& out, const c10::optional<at::Tensor>& part, int64_t n, int64_t sk,
+-             bool f32, int64_t cfg) {
+-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
+-                x.size(0) <= 16 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 16, K) bf16");
+-    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
+-                "x rows must start on 16-byte boundaries");
+-    const int64_t m = x.size(0), k = x.size(1), kg = k / 64, npad = (n + 127) / 128 * 128;
+-    TORCH_CHECK(k % 64 == 0 && sk >= 1 && kg % sk == 0, "K splits into whole groups a slice");
+-    TORCH_CHECK(xs.is_cuda() && xs.is_contiguous() && xs.scalar_type() == at::kFloat && xs.size(0) == m &&
+-                xs.size(1) == kg, "xs: (M, K / 64) fp32");
+-    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt && w.numel() == npad * k / 8,
+-                "packed weight does not match n and K");
+-    TORCH_CHECK(scales.stride(1) == 1 && biases.stride(1) == 1 && scales.stride(0) >= npad &&
+-                biases.stride(0) == scales.stride(0) && scales.scalar_type() == at::kBFloat16 &&
+-                biases.scalar_type() == at::kBFloat16 && scales.size(0) == kg && scales.size(1) == npad,
+-                "scales and biases: (K / 64, n padded to 128) bf16");
+-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == m && out.size(1) == n &&
+-                out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
+-    c10::cuda::CUDAGuard guard(x.device());
+-    at::Tensor p;
+-    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), true)) {
+-        p = part.has_value() ? *part : at::empty({sk, m, n}, x.options().dtype(at::kFloat));
+-        TORCH_CHECK(p.is_contiguous() && p.scalar_type() == at::kFloat && p.numel() >= sk * m * n, "part");
+-    }
+-    qmm_cfg_cuda(x, xs, w, scales, biases, out, p, static_cast<int>(n), static_cast<int>(sk), f32,
+-                 static_cast<int>(cfg));
+-}
+-
+ // Prefill: x (M, K) bf16 times a packed 4-bit weight with each weight rounded once to bf16, one fp32 chain over K.
+ void qmm_prefill(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
+                  at::Tensor& out, int64_t n, int64_t gs, bool f32, int64_t tile) {
+diff --git tensorfold/cuda/kernels/qmm.cu tensorfold/cuda/kernels/qmm.cu
+index e740e6c..d644379 100644
+--- tensorfold/cuda/kernels/qmm.cu
++++ tensorfold/cuda/kernels/qmm.cu
+@@ -307,28 +307,6 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
+     }
+ }
+ 
+-// Decode rows (a 16-row tile) on other column tiles, warps and stage counts: every output's chain (groups in order
+-// within its K slice, slices added in order) is qmm_kernel's, so every choice gives the same bits.
+-template <bool F32, bool CLUSTER>
+-void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& s,
+-                  const at::Tensor& b, at::Tensor& out, const at::Tensor& part, int N, int SK) {
+-    switch (cfg) {
+-        case 0: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 1: launch<64, 16, 128, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 2: launch<64, 16, 128, 1, 8, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 3: launch<64, 16, 64, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 4: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 5: launch<64, 16, 64, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 6: launch<64, 16, 128, 1, 8, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 7: launch<64, 16, 64, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 8: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-11");
+-    }
+-}
+-
+ } // namespace
+ 
+ // Clusters hold up to 8 K slices (the portable size) from sm_90; more, unreduced slices or older GPUs use the buffer.
+@@ -357,27 +335,6 @@ void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w
+     }
+ }
+ 
+-// ``qmm_cuda`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg``.
+-void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+-                  const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, bool f32, int cfg) {
+-    const int M = x.size(0);
+-    TORCH_CHECK(M <= 16, "qmm_cfg: decode rows (up to 16)");
+-    const bool cluster = qmm_clusters(SK, true);
+-    if (f32) { if (cluster) dispatch_cfg<true, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
+-               else dispatch_cfg<true, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
+-    else { if (cluster) dispatch_cfg<false, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
+-           else dispatch_cfg<false, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
+-    if (SK > 1 && !cluster) {
+-        const long long total = static_cast<long long>(M) * N;
+-        const int threads = 256;
+-        const int blocks = static_cast<int>((total + threads - 1) / threads);
+-        auto stream = at::cuda::getCurrentCUDAStream();
+-        if (f32) reduce_kernel<true><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
+-        else reduce_kernel<false><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
+-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+-    }
+-}
+-
+ void qmm_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+               const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, int gs, int bm,
+               bool f32, bool reduce) {
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
 index 3cf6188..d746ea7 100644
 --- tensorfold/cuda/server.py
