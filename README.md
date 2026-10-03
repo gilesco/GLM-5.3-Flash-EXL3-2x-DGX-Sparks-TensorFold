@@ -35,64 +35,30 @@ vision, tool calling, `/tokenize` and `/metrics`.
 ## Performance
 
 Two DGX Sparks at the default configuration (4 streams, 1,048,576-token window, FP8 KV cache, 4-bit dense weights,
-DFlash2 plus copy drafts, vision on), with the GPU clocks capped at 2,200 MHz. Decode and prefill were measured with
-[sparkDash](https://github.com/MiaAI-Lab/sparkDash) through the OpenAI API, from another machine on the network.
+DFlash2 plus copy drafts, vision on). Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) through the
+OpenAI API from another machine on the network, on TensorFold v0.6.4 (2026-10-03), GPU clocks not capped.
 
 **Decode** (aggregate across the concurrent requests, per request, and time to first token)
 
-| Concurrent requests | Prose | Prose, per request | TTFT | Structured | Structured, per request | TTFT |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 60.4 tok/s | 60.4 tok/s | 170 ms | 114.7 tok/s | 114.7 tok/s | 149 ms |
-| 2 | 79.2 tok/s | 40.4 tok/s | 269 ms | 147.6 tok/s | 77.1 tok/s | 295 ms |
-| 3 | 89.5 tok/s | 30.6 tok/s | 330 ms | 196.3 tok/s | 67.4 tok/s | 317 ms |
-| 4 | 108.8 tok/s | 27.9 tok/s | 340 ms | 227.9 tok/s | 61.1 tok/s | 415 ms |
-
-Replies served 4 at a time are identical to the same requests served one at a time (11 of 11 cases staggered, and 11
-of 11 sent in a burst).
-
-**Up to 8 requests at once** (`PARALLEL=8`, v1.5; its verify window then defaults to 64 rows). Measured with sparkDash on
-one boot (2026-10-03); one or two requests decode as fast as at `PARALLEL=4`:
-
-| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4 | 103.2 tok/s | 26.8 tok/s | 298 ms | 126.7 tok/s | 34.1 tok/s | 446 ms |
-| 6 | 116.8 tok/s | 20.6 tok/s | 362 ms | 150.0 tok/s | 26.8 tok/s | 457 ms |
-| 8 | 130.8 tok/s | 17.0 tok/s | 405 ms | 167.0 tok/s | 22.8 tok/s | 733 ms |
-
-Eight at once: +27% prose and +32% code over four. The window matters for code (8 requests: 141.2 / 160.3 / 167.0
-tok/s at 32 / 48 / 64 rows), not prose. Replies stay identical to one at a time (11 of 11 staggered and in a burst, 8
-in flight; drafted == serial). The memory reserve grows with `PARALLEL` (see `MEMORY_RESERVE_GIB`), so the shared pool
-is ~1.5M tokens at 8 instead of 2.0-2.6M at 4, with the head's lowest free memory at 12.9 GiB under a 195k-token
-prompt. Two Sparks therefore stay at 4 by default; three Sparks default to 8 ([3 Sparks](#3-sparks-experimental)).
+| Concurrent requests | Prose | Prose, per request | TTFT | Structured | Structured, per request | TTFT | Code | Code, per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 61.2 tok/s | 61.2 tok/s | 174 ms | 110.5 tok/s | 110.5 tok/s | 156 ms | 84.9 tok/s | 84.9 tok/s | 238 ms |
+| 2 | 78.7 tok/s | 39.4 tok/s | 310 ms | 174.5 tok/s | 87.2 tok/s | 250 ms | 115.3 tok/s | 57.6 tok/s | 323 ms |
+| 4 | 107.8 tok/s | 27.0 tok/s | 312 ms | 149.7 tok/s | 37.4 tok/s | 432 ms | 134.9 tok/s | 33.7 tok/s | 460 ms |
 
 **Prefill**
 
 | Prompt | Prefill | Time to first token |
 | ---: | ---: | ---: |
-| 8,219 tokens | 1,952.2 tok/s | 4.21 s |
-| 16,407 tokens | 1,973.5 tok/s | 8.31 s |
-| 32,790 tokens | 1,978.9 tok/s | 16.57 s |
-| 65,563 tokens | 1,942.5 tok/s | 33.75 s |
-| 131,099 tokens | 1,837.9 tok/s | 71.33 s |
-| 262,170 tokens | 1,641.7 tok/s | 159.69 s |
-| 981,841 tokens (needle in a haystack) | 1,015 tok/s | 967 s, needle found |
+| 8,218 tokens | 1,967.1 tok/s | 4.18 s |
+| 16,405 tokens | 1,965.5 tok/s | 8.35 s |
+| 32,792 tokens | 2,010.6 tok/s | 16.31 s |
+| 65,559 tokens | 1,962.0 tok/s | 33.42 s |
+| 131,096 tokens | 1,842.5 tok/s | 71.15 s |
 
-**Prompt reuse** (the server resumes from a kept prompt state instead of prefilling, with the same reply)
-
-| Prompt | First time | Next time |
-| --- | ---: | ---: |
-| An identical 64k-token prompt, sent again | 34 s | under 0.07 s |
-| A new conversation with the same 7.9k-token system prompt | 4.24 s | 0.13 s |
-
-**Quality** (FP8 KV cache and 4-bit dense weights, see [Checks](#checks))
-
-| Benchmark | Score |
-| --- | ---: |
-| GSM8K (250 problems, thinking off) | 98.8% |
-| HumanEval (164 problems, thinking off) | 95.7% |
-| HumanEval+ and MBPP+ (542 problems, thinking on) | 86.5% |
-
-Details on the [model card](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold).
+Prompt-reuse, 8-requests-at-once and quality figures (GSM8K, HumanEval, MBPP+) are not re-measured on v0.6.4 yet;
+the quality scores of the earlier, v0.6.0-based recipe are on the
+[model card](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold).
 
 ## Requirements
 
@@ -309,50 +275,14 @@ exported path as the worker mounts it (default: the head's `HF_CACHE`; `/` for a
 (TensorFold v0.6.4 itself serves two ranks only), in the same published image as two Sparks (`prepare.sh` pulls it on the head and copies it to every worker). **Three Sparks** were tested on v1.3.2's patches (exact against two Sparks, drafted == serial, images and
 tool calls, concurrent requests). On top of v1.4 (2026-10-03, `KV_POOL_GIB=27`, NCCL, two boots: sliced fill on and
 off): concurrent requests equal one at a time (22/22 each boot), drafted == serial (6/6), long-prompt replies and every
-streamed reply the same with the sliced fill on and off, the 195k needle right (prefill 115.0 s), a prompt cancelled
-mid-fill gone in 0.16 s with the other replies unchanged, tool calls whole. Prefill 12k / 50k / 149k: 6.2 / 25.7 / 84.2 s
-(two Sparks: 6.5 / 26.8 / 87.1). Streaming, gaps p50 / p90 between a reply's events: one reply 15 / 18 ms, four at
-once 34 / 46 ms; three replies while a ~25k-token prompt fills 81 / 134 ms with the sliced fill (134 / 400 ms with
-`FILL_BUDGET_MS=0`). Rank 0 had 10.6 GiB free idle and 8.4 GiB at its lowest (a 149k prompt); at the default 32 GiB
+streamed reply the same with the sliced fill on and off, the 195k needle right, a prompt cancelled
+mid-fill gone with the other replies unchanged, tool calls whole. Rank 0 had 10.6 GiB free idle and 8.4 GiB at its lowest (a 149k prompt); at the default 32 GiB
 it had 5.8 GiB free idle, below the ~10 GiB this recipe keeps under load, so these runs used 27. With v1.5's defaults at
 three Sparks (8 requests, a 64-row window, the reserve grown to 19.6 GiB) the pool is ~4.0M tokens and rank 0 had
 14.4 GiB free idle and 11.5 GiB at its lowest under a 195k-token prompt (ranks 1 and 2: 27.6 / 21.1 GiB).
 
-**Three Sparks, measured with sparkDash** (the default configuration otherwise: 4 streams, 1,048,576-token window, FP8 KV
-cache, 4-bit dense weights, DFlash2 plus copy drafts, vision on)
-
-| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 77.6 tok/s | 77.6 tok/s | 144 ms | 104.3 tok/s | 104.3 tok/s | 192 ms |
-| 2 | 95.7 tok/s | 49.5 tok/s | 264 ms | 139.0 tok/s | 72.7 tok/s | 293 ms |
-| 3 | 121.2 tok/s | 42.0 tok/s | 249 ms | 158.7 tok/s | 55.5 tok/s | 379 ms |
-| 4 | 146.2 tok/s | 37.3 tok/s | 262 ms | 169.6 tok/s | 45.7 tok/s | 348 ms |
-
-| Prompt | Prefill | Time to first token |
-| ---: | ---: | ---: |
-| 8,212 tokens | 2,000.6 tok/s | 4.59 s |
-| 16,408 tokens | 2,000.4 tok/s | 8.20 s |
-| 32,790 tokens | 2,064.2 tok/s | 15.89 s |
-| 65,560 tokens | 2,003.6 tok/s | 32.72 s |
-| 131,094 tokens | 1,881.7 tok/s | 69.67 s |
-| 262,169 tokens | 1,654.5 tok/s | 158.45 s |
-
-Against two Sparks ([Performance](#performance)): prose decode 60.4 -> 77.6 tok/s for one request and 108.8 -> 146.2
-tok/s for four at once; prefill about the same (1-4% faster).
-
-**Three Sparks, 8 requests at once** (v1.5's default there: `PARALLEL=8`, 64-row window, `COMM=nccl`; one boot,
-2026-10-03, so compare its rows with each other rather than with the table above, which another boot measured):
-
-| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 65.7 tok/s | 65.7 tok/s | 143 ms | 100.4 tok/s | 100.4 tok/s | 187 ms |
-| 2 | 93.8 tok/s | 48.6 tok/s | 229 ms | 129.5 tok/s | 65.6 tok/s | 280 ms |
-| 4 | 121.8 tok/s | 31.8 tok/s | 336 ms | 165.3 tok/s | 43.1 tok/s | 356 ms |
-| 6 | 146.3 tok/s | 26.1 tok/s | 391 ms | 192.6 tok/s | 33.4 tok/s | 381 ms |
-| 8 | 166.0 tok/s | 21.7 tok/s | 337 ms | 211.5 tok/s | 28.9 tok/s | 612 ms |
-
-Eight at once: +36% prose and +28% code over four. Replies identical to one at a time (11 of 11 staggered and in a
-burst), drafted == serial, the 195k needle right.
+Measured three-Sparks figures (decode, prefill, 8 requests at once) are not published here; measure them
+with sparkDash as in [Performance](#performance).
 
 `DRY_RUN=1 ./start-tp3.sh` shows what would run (every rank's `docker run`, the links found, nothing stopped or
 started). It uses NCCL for every all-gather by default (`COMM=nccl`); `COMM=roce ./start-tp3.sh` sends the small
