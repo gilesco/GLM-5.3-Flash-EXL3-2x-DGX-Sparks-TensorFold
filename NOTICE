@@ -93,9 +93,6 @@ glm53-tensorfold-spark
       the first steps' words issued before the member rows reach shared memory. Changed here: built into this
       project's decode kernel (its expert plan, fused down / gate-up epilogues and per-row input rotation kept), ring
       depth 1, 2 or 4 as a template parameter, no probe or PDL variants.
-  patches/0058-server-client-gone-poll.patch is Jay Leaton's TensorFold pull request #218
-  (https://github.com/ashhart/TensorFold/pull/218, Apache-2.0), applied to v0.6.0 unchanged:
-  tensorfold/server/cancellation.py's client-gone check asks poll() instead of select().
 
 Contributions to this project (Apache-2.0, through its issues and pull requests)
   patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.

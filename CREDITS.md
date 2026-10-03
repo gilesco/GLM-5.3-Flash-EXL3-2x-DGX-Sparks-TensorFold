@@ -83,9 +83,6 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [abhicnv007](https://github.com/abhicnv007), applied as contributed, with two small review changes.
 - `0057-server-thinking-alias` (`chat_template_kwargs.thinking`): from [Alexbob0](https://github.com/Alexbob0)'s
   pull request #25; the `{"type": ...}` forms and the refusal of other values were added here.
-- `0058-server-client-gone-poll`: [TensorFold PR #218](https://github.com/ashhart/TensorFold/pull/218) by
-  [jayleaton](https://github.com/jayleaton) (Apache 2.0), applied unchanged: the client-gone check sees descriptors
-  past 1023.
 - `0059-server-refused-bodies`: TensorFold v0.6.1's fix for #181 (commit 50dfe38a, by
   [SxMShaDoW](https://github.com/SxMShaDoW)), backported to v0.6.0.
 - `0060-glm-keep-thinking` (earlier turns keep their reasoning, `TF_GLM_CLEAR_THINKING`): by

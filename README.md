@@ -231,7 +231,7 @@ the progress lines, the window retry or the smoke test; when either rank ends, i
 2. The image `tensorfold-glm53:v0.6.4` on the head: TensorFold v0.6.4 with every `patches/*.patch` applied, plus PyAV
    (video decoding) and xgrammar (structured outputs), on NVIDIA's `nvcr.io/nvidia/pytorch:26.07-py3`. It first
    pulls the published image `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.4-<image hash>`,
-   by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`) while the patches are this release's
+   by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`) while the patches still hash to that release's
    (the hash covers the patches and those pip packages); after you change `patches/`, it pulls that hash's tag if
    one is published, else (or with `PULL=0`) it builds.
 3. The same image on the worker: pulled, else streamed from the head (`docker save | docker load`), checked identical.
