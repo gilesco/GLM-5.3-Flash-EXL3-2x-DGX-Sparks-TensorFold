@@ -1,6 +1,9 @@
 # Copy to scripts/local.sh (not in git) and fill in this setup's values; scripts/config.sh reads it first.
 WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-copy-id user@192.0.2.2)
 # FABRIC_PEER=192.0.2.12       # the worker's CX7 address, when WORKER is reached over another network
+
+# The patches are made for TensorFold v0.6.4 (config.sh still defaults to production's v0.6.0; see REBASE-NOTES.md):
+TF_VERSION=v0.6.4
 # A third Spark (./start-tp3.sh, experimental; README "3 Sparks"):
 # WORKER2=user@192.0.2.3       # rank 2
 # WORKER_WEIGHTS2=nfs          # per worker: copy or nfs (default: WORKER_WEIGHTS)
