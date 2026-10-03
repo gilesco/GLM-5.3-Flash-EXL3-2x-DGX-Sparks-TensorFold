@@ -1,5 +1,9 @@
 <h1 align="center">GLM-5.3-Flash EXL3 on DGX Sparks with TensorFold</h1>
 
+> [!NOTE]
+> This repository is a fork of [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold).
+> **All commits made since the fork were generated with AI assistance.**
+
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
   <br><br>
