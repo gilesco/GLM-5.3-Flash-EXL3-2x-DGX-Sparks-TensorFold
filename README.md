@@ -36,7 +36,9 @@ vision, tool calling, `/tokenize` and `/metrics`.
 
 Two DGX Sparks at the default configuration (4 streams, 1,048,576-token window, FP8 KV cache, 4-bit dense weights,
 DFlash2 plus copy drafts, vision on). Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) through the
-OpenAI API from another machine on the network, on TensorFold v0.6.4 (2026-10-03), GPU clocks not capped.
+OpenAI API from another machine on the network, on TensorFold v0.6.4 (2026-10-03). The GPU clocks were capped
+at 2,200 MHz (the head sets `nvidia-smi -lgc 200,2200` at boot via `nvidia-power-limit.service`), so the GPU was
+intentionally rate-limited.
 
 **Decode** (aggregate across the concurrent requests, per request, and time to first token)
 
