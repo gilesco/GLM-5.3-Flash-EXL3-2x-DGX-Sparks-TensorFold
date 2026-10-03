@@ -128,6 +128,45 @@ index 7734db1..3cf6188 100644
              stats = self.engine.generate(ids, count, sampling, feed, **extra)
              if not cached:
                  cached.append(int((stats or {}).get("cached") or 0))
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 2ec8ce9..ac4c378 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -15,27 +15,25 @@ from tensorfold.server.errors import CONTEXT_LIMIT
+ 
+ class ThinkingOffTemplate:
+     """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
+-    (``prompts.thinking_off``), an agent's history made renderable first (``prompts.agent_history``), with the
+-    reasoning of tool-calling steps the client dropped put back (``kept``, ``kept_reasoning.KeptReasoning``; None:
+-    off), and earlier turns' reasoning kept unless ``chat_template_kwargs.clear_thinking`` says otherwise."""
++    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
++    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
++    ``kept_reasoning.KeptReasoning``; None: off)."""
+ 
+-    def __init__(self, inner, kept: KeptReasoning | None = None, clear: bool | None = None) -> None:
++    def __init__(self, inner, kept: KeptReasoning | None = None, clear_thinking: bool = False) -> None:
+         self.inner = inner
+         self.efforts = getattr(inner, "efforts", frozenset())
+         self.kept = kept
+-        self.clear = clear_thinking() if clear is None else clear
+-
++        self.clear_thinking = clear_thinking
+ 
+     def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+         if self.kept is not None:
+             messages = self.kept.restore(messages)
+-        extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
+-
++        # earlier turns keep their reasoning unless the request says otherwise, as in zai-org's current template
++        extra = {"clear_thinking": self.clear_thinking, **(extra or {})}
+         text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                  allow_images=allow_images)
+         return text if enable_thinking else thinking_off(text)
+ 
+-
+ # the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
+ # (Glm5NextProcessor's layout), and every text-only prompt renders as before. A part's ``tf_mark`` (server.prompts'
+ # MediaMarks, taken out again before the prompt is encoded) goes before its markers
 diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
 index 40aa44e..eeb54be 100644
 --- tensorfold/families/glm5_next/cuda/decode.py

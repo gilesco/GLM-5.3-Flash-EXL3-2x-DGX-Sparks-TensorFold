@@ -70,6 +70,15 @@ v0.6.0 recipe did (`exl3_words` + the 12-arg constructor); the only remaining we
 delta vs production is v0.6.4's mixed-bit refusal (#226), which our uniform-4bpw checkpoint
 passes. `exl3_mm.py` is byte-identical to production's.
 
+## Third-start fix (2026-10-03)
+
+Graph capture, drafter calibration, vision and the parallel pool all came up; the server
+died constructing the app: the merged ThinkingOffTemplate kept v0.6.4's `clear=` parameter
+name while its caller (0060, as in production) passes `clear_thinking=`. The class is now
+production's verbatim. A tree-wide construction check (every class instantiation's
+keywords against its __init__ / dataclass fields, import-resolved) now reports only two
+pre-existing upstream notes in deepseek_v4 — nothing in the GLM path.
+
 ## Not verified here (no GPU on this box)
 
 - CUDA kernel compilation and the actual serve (start.sh does both). py_compile passed for
