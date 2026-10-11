@@ -68,10 +68,10 @@ index 127ea01..b5dcd26 100644
          return out
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index a8408b4..9e4817a 100644
+index 85390b8..ed2a0d9 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -502,17 +502,24 @@ class GlmEngine:
+@@ -505,17 +505,24 @@ class GlmEngine:
  
          self.dump = dump_dir() if drafter is not None and not serial_only and parallel == 1 else None
          quant_code = DRAFT_QUANTS.index(draft_quant())
@@ -98,7 +98,7 @@ index a8408b4..9e4817a 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -523,7 +530,8 @@ class GlmEngine:
+@@ -526,7 +533,8 @@ class GlmEngine:
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                 "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
@@ -108,7 +108,7 @@ index a8408b4..9e4817a 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -641,7 +649,10 @@ class GlmEngine:
+@@ -644,7 +652,10 @@ class GlmEngine:
                  print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
                        f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
                        f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "

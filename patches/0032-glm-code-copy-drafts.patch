@@ -166,7 +166,7 @@ index 3aa3b25..10860da 100644
 +            return drafts
 +        return drafts + [drafts[-1]] * (width - rows)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 1917b68..a8408b4 100644
+index 8f62477..85390b8 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -17,7 +17,48 @@ DEFAULT_POLICY = "auto"
@@ -228,7 +228,7 @@ index 1917b68..a8408b4 100644
          from .hcsplit import SplitSettings
  
          # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
-@@ -468,9 +509,10 @@ class GlmEngine:
+@@ -471,9 +512,10 @@ class GlmEngine:
              verify_code = 1 + ("batched", "serial").index(verify_kind())
          # both ranks must run the same calls: refuse to start when they were given different settings
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
@@ -241,7 +241,7 @@ index 1917b68..a8408b4 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -481,7 +523,7 @@ class GlmEngine:
+@@ -484,7 +526,7 @@ class GlmEngine:
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                 "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
@@ -250,7 +250,7 @@ index 1917b68..a8408b4 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -530,13 +572,21 @@ class GlmEngine:
+@@ -533,13 +575,21 @@ class GlmEngine:
  
              self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
          self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
@@ -273,7 +273,7 @@ index 1917b68..a8408b4 100644
          if rank == 0 and self.dump is not None:
              print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
                    f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
-@@ -894,9 +944,7 @@ class GlmEngine:
+@@ -901,9 +951,7 @@ class GlmEngine:
          policy = decode_policy(code, self.costs)
          copies = None
          if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks

@@ -97,10 +97,10 @@ index bba421c..93535a4 100644
              if r is not recv:
                  recv.copy_(r)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index e04f46c..c5e40b5 100644
+index c3f8787..6823519 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -683,6 +683,8 @@ class GlmEngine:
+@@ -686,6 +686,8 @@ class GlmEngine:
                  if self.multi.row_ms is not None:
                      print("[tensorfold] --parallel batched window ms by rows: " +
                            " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)

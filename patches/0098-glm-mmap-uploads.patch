@@ -1,0 +1,26 @@
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index 875212d..354d697 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -274,7 +274,7 @@ class Drafter:
+ 
+         with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
+             def get(name: str) -> torch.Tensor:
+-                return f.get_tensor(name)
++                return f.get_tensor(name).clone()
+ 
+             self.fc = quantize4(gpu(get("fc.weight")))
+             self.hidden_norm = gpu(get("hidden_norm.weight"))
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index 7369e66..7d7ccc8 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -347,7 +347,7 @@ class GlmVisionTower:
+             with safe_open(str(model_dir / file), framework="pt", device="cpu") as f:
+                 for n in names:
+                     if index[n] == file:
+-                        t[n[len("model.visual."):]] = f.get_tensor(n).to(device=device, dtype=torch.bfloat16)
++                        t[n[len("model.visual."):]] = f.get_tensor(n).clone().to(device=device, dtype=torch.bfloat16)
+         self.weight_bytes = sum(x.numel() * x.element_size() for x in t.values())
+         self.t = t
+         self.device = device

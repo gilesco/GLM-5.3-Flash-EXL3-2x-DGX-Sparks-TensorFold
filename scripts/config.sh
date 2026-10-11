@@ -47,13 +47,22 @@ fi
 MASTER_ADDR="${MASTER_ADDR:-$_ma}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 
-MODEL_ID="${MODEL_ID:-Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold}"   # EXL3 routed experts (4 bpw), BF16 elsewhere
+# ABLIT=1 serves the Ablit weights, Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit (the same checkpoint,
+# abliterated; README "Ablit weights"), instead of the published checkpoint; 0 (default) the published one. The Ablit
+# repository is gated: HF_TOKEN must be set (a Hugging Face access token whose account accepted the terms on the
+# model's page), or prepare.sh, start.sh and start-tp3.sh stop and say so. Switching downloads the other checkpoint
+# (~176 GB). With ABLIT=1, THINKING defaults to 0 (below).
+ABLIT="${ABLIT:-0}"
+ABLIT_ID="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit"
+_id="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold"; [[ "$ABLIT" == 1 ]] && _id=$ABLIT_ID
+MODEL_ID="${MODEL_ID:-$_id}"   # EXL3 routed experts (4 bpw), BF16 elsewhere
 # The checkpoint's revision (a Hugging Face commit sha; DFLASH2_REVISION below is DFlash2's): the one this recipe was
 # measured with. prepare.sh downloads exactly it, start.sh serves that snapshot from the local cache (no network), and
-# a new upstream commit changes nothing here until the pin does. Empty: the Hub's main when first downloaded. The pin
-# belongs to the checkpoint above; another MODEL_ID gets no pin unless you set one.
+# a new upstream commit changes nothing here until the pin does. Empty: the Hub's main when first downloaded. The pins
+# belong to the checkpoints above; another MODEL_ID gets no pin unless you set one.
 case "$MODEL_ID" in
   Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=078455ffe6472f9a52fbc1139f58b9db2881b25c ;;
+  Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit) _rev=57edefd2f5d9b371c8345883304d5af68b52fa24 ;;
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
@@ -70,8 +79,8 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
 # The same image serves two and three Sparks.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-9f73cca659a1}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:ef83797d791fef96c4605e8d37367aca6de5aeac7bb672792cb682e2e55d4237}"
+IMAGE_TAG="${IMAGE_TAG:-v0.6.0-e66c657a433d}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:14b5072e8e9918f1080153f57321415a387bc7d78cf9c9b44a7aeae2d4399ccf}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
@@ -116,7 +125,10 @@ CONTEXT="${CONTEXT:-$_ctx}"
 DFLASH2_ID="${DFLASH2_ID:-incoai/GLM-5.3-Flash-DFlash2}"
 _rev=""; [[ "$DFLASH2_ID" == incoai/GLM-5.3-Flash-DFlash2 ]] && _rev=bf582e4eacc1810f76656d1811693ff6c6737d2a
 DFLASH2_REVISION="${DFLASH2_REVISION-$_rev}"   # DFlash2's pinned revision, as MODEL_REVISION above
-THINKING="${THINKING:-1}"
+# Think before answering by default (0: answer directly unless a request asks to think); off by default with the Ablit
+# weights (ABLIT=1), which give their best results without thinking
+_think=1; [[ "$MODEL_ID" == "$ABLIT_ID" ]] && _think=0
+THINKING="${THINKING:-$_think}"
 # The reply budget of a request that sets no max_tokens (or max_completion_tokens), reasoning and answer together:
 # 32768. GLM thinks at Max by default, and TensorFold's own 4,096 could end a reply inside a tool call (an agent such
 # as Codex sets none). A request's own value wins; this one is cut to what the window has left, never refused.
@@ -139,6 +151,12 @@ export TF_GLM_COMM="$COMM"
 # TensorFold's is 256) also takes the 17-32-row verify windows of concurrent requests: code at 4 streams +1.4%, prose
 # +0.5-1% (two boots each). Same bits.
 export TF_ROCE_MAX_KB="${TF_ROCE_MAX_KB:-512}"
+# How long a RoCE all-gather waits for the other Spark before it fails, in seconds (patch 0052 reads it; 1 to 3600):
+# 300 here (the patch's own default is 20). Issue #54: on long prompts (~475k-500k tokens, or after many hours) a rank
+# failed after its 20 s while its own writes had all completed, i.e. the peer was late, not lost, and both Sparks went
+# down. A late peer now costs a slow round instead; a rank that is really gone is noticed after 300 s instead of 20,
+# like the watchdog's stall report (TF_GLM_MULTI_WATCHDOG_S, 300). NCCL's own gathers have no limit at all.
+export TF_ROCE_WAIT_S="${TF_ROCE_WAIT_S:-300}"
 # Prompt-lookup ("copy") drafts (patch 0007): when the reply's last 8 tokens occurred before, the tokens that followed
 # them are verified ahead of DFlash2's; quote / edit replies +5% (80.3 -> 84.4 tok/s), prose and code unchanged. Exact.
 COPY="${COPY:-1}"
@@ -189,9 +207,47 @@ fi
 # or four alternating conversations push each other out (issue #17). Each entry reserves its fixed state (~45 MiB) at
 # start: 32 takes ~1 GiB more than 8.
 export TF_GLM_CACHE_ENTRIES="${TF_GLM_CACHE_ENTRIES:-32}"
+# TF_GLM_CACHE_SHARE_PCT (patch 0097, off by default; issue #84 by @jdecker76): the count above is also a memory
+# reservation (the pool shrinks by each entry's fixed state, ~91 MiB measured on two Sparks at the defaults; the
+# estimate is unchanged), so a pool with millions of free tokens
+# can still evict a live conversation at the 33rd state. A share makes the count at least that part of KV_POOL_GIB's
+# budget (~7.5 GiB on two Sparks at the defaults, where 32 states already take ~38%: 50 is ~42 states, 75 ~63). Any count is cut to 75% of the budget, logged at start. Watch
+# /health kept_prompts against pool_free_tokens: kept_prompts pinned at the count with a free pool is this symptom.
+export TF_GLM_CACHE_SHARE_PCT="${TF_GLM_CACHE_SHARE_PCT:-0}"
+# Two more limits on the kept states (patch 0089, both off by default; PR #65 by Thomas Wade): TF_GLM_KEPT_BYTES_GIB
+# caps the device memory the kept states own outside the pool (their DFlash2 window copies and recurrent state, ~45 MiB
+# each without a window, hundreds of MB with long ones), together: 0 is no cap, 4 is the author's value; past it the
+# least valuable state is dropped (by the same order as the entry count's) and freed blocks go back to the driver.
+# TF_GLM_KEEP_PER_CHAT keeps at most this many of one conversation's own turn-boundary states (the author runs 2; 0 is
+# no limit): one long chat can no longer fill the entries alone. Neither is written to the spill tier when it drops.
+# /health shows kept_bytes, kept_bytes_cap and kept_mix.
+export TF_GLM_KEPT_BYTES_GIB="${TF_GLM_KEPT_BYTES_GIB:-0}"
+export TF_GLM_KEEP_PER_CHAT="${TF_GLM_KEEP_PER_CHAT:-0}"
 # Earlier turns keep their reasoning in the prompt (patch 0060), as in zai-org's current template. 1: drop it, as the
 # checkpoint's template does; agents then prefill the previous turn's tool loop again at each new user message.
 export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
+# The reasoning-effort line ("<|system|>Reasoning Effort: Max") is token 3 of the checkpoint's prompt, so switching effort
+# or thinking on/off changes the whole prompt and misses the kept-prompt cache (issue #93, by jdecker76). 1 (patch 0096):
+# render it at the tail instead, just before "<|assistant|><think>", so the conversation stays identical across the
+# switches (thinking off has no line, as before). Off by default: it moves a line the model was trained to see first, so
+# check the effort levels still answer differently (tools/toolcheck.py, tools/end_of_turn.py) before relying on it.
+# Not a request field: it changes every thinking-on prompt, and every rank reads it with the other TF_GLM_* switches.
+export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
+# Admission at saturation (patch 0075): past the lanes plus MAX_QUEUED a foreground request is refused with
+# 429 + Retry-After (529 overloaded_error through the Anthropic bridge) instead of queueing invisibly. Unset
+# queues as every scheduler always has; 0 refuses anything past the lanes. A single-instance deployment with
+# no load balancer in front of it should set a small value (ours: 0, in scripts/local.sh).
+MAX_QUEUED="${MAX_QUEUED:-}"
+# A streamed request is checked before its 200 goes out (patch 0095), so it gets the same 429 + Retry-After.
+export TF_GLM_MAX_QUEUED="$MAX_QUEUED"
+# Sampled decode with the checkpoint's defaults (temperature 1, top_p 0.95, top_k 0) draws from the top_p nucleus
+# (patch 0034). Stock TensorFold tests each rank's candidates alone, which fails on any two ranks whenever both hold
+# part of the nucleus, so every such step gathered and sorted the whole vocabulary on the CPU: ~15 tok/s against
+# greedy's ~58 on two Sparks (issue #91). NUCLEUS_UNION=1 (the default) tests the ranks' candidates together: the
+# same nucleus and the same draw (the merged walk stops above every partial rank's last candidate, so no unsent token
+# can be in it; tools/test_nucleus_union.py compares both paths), 42-61 tok/s. A step whose nucleus is still wider
+# makes one extra 16,384-candidate gather before the whole shards. 0: stock behaviour. Every rank gets the same value.
+export TENSORFOLD_NUCLEUS_UNION="${NUCLEUS_UNION:-${TENSORFOLD_NUCLEUS_UNION:-1}}"
 # Waiting prompts filled together in one forward (patch 0049): shared work (expert weights, glue, projections) runs once
 # for every waiting prompt, attention per prompt on its own state, so each gets the bits it gets alone. sparkDash, prose at
 # 4 at once: 103.4 -> 108.8 tok/s, time to first token 590 -> 340 ms; structured at 3 / 4 at once: 175.2 -> 196.3 and
@@ -205,14 +261,23 @@ export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
 STREAM_SMOOTH="${STREAM_SMOOTH:-1}"
 STREAM_SMOOTH_MS="${STREAM_SMOOTH_MS:-400}"
 export TF_GLM_STREAM_SMOOTH="$STREAM_SMOOTH" TF_GLM_STREAM_SMOOTH_MS="$STREAM_SMOOTH_MS"
-# Concurrent prompt fills in layer slices (patch 0062): while other requests decode, a new prompt's 1,024-row chunks
+# Concurrent prompt fills in layer slices (patch 0062): while other requests decode, a new prompt's FILL_ROWS chunks
 # run a few layers at a time (about FILL_BUDGET_MS each) with a decode round between slices, instead of freezing the
 # other replies for a whole chunk. FILL_DRAFTS=1 (default): those rounds draft as usual (~3 tokens a stream);
 # 0: one token a stream (the new prompt's first token sooner, the others slower while it fills). FILL_BUDGET_MS=0:
 # whole chunks, as before. A request alone fills at full speed either way. Same replies.
 FILL_BUDGET_MS="${FILL_BUDGET_MS:-200}"
 FILL_DRAFTS="${FILL_DRAFTS:-1}"
-export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS"
+# FILL_ROWS (TensorFold's TF_GLM_FILL_ROWS, whose own default is 1,024): the rows of such a fill's chunk. 2,048
+# (default) is the whole prompt chunk (TF_GLM_PREFILL_ROWS, 2,048), whose buffers already exist: the same memory and
+# the same replies (a token's result does not depend on the chunk it is filled in), half the passes over the weights.
+# Three Sparks, PARALLEL=4, a prompt filling while another reply streams: a warm +20k turn on a 596k conversation
+# 15.6-15.7 -> 14.0-14.1 s, a cold 256k prompt 132.2-132.6 -> 113.4-114.0 s; the streaming reply's gaps the same
+# (max 25-67 ms either way). At most the prompt chunk (the engine refuses more): a smaller TF_GLM_PREFILL_ROWS lowers
+# the default with it. 1024: as before.
+_fill_max="${TF_GLM_PREFILL_ROWS:-2048}"
+FILL_ROWS="${FILL_ROWS:-${TF_GLM_FILL_ROWS:-$(( _fill_max < 2048 ? _fill_max : 2048 ))}}"
+export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS" TF_GLM_FILL_ROWS="$FILL_ROWS"
 # L2 prefetch in decode windows (patch 0046, adapted from jayleaton/glm53-tensorfold-spark's patch 0460): a side stream
 # brings the weights the next kernels read into L2 during each layer's all-gathers. 1 (default): one request's prose
 # 48.36 -> 49.46 tok/s, code 59.54 -> 61.08 (two boots each). Same bits. 0: off.
@@ -222,6 +287,11 @@ export TF_GLM_L2PF="${TF_GLM_L2PF:-1}"
 # Together with TF_GLM_L2PF=1 and TF_ROCE_MAX_KB=512: one request's prose 49.68, code 61.49 (+2.7% / +3.3%); 4 at once
 # prose 74.8 -> 76.6, code 100.0 -> 102.7 tok/s in all (two boots each). Same bits. 0: TensorFold's 32-bit loads.
 export TF_GLM_EXL3_LOADS="${TF_GLM_EXL3_LOADS:-nc}"
+# The decode expert kernel's block launch order (patch 0090, by lukaszraczylo): 0 (default) the grid as launched, items
+# fastest; 1: the eight 128-column blocks of one k slice run together (contiguous trellis reads), then the items; 2: then
+# the matrices and splits. The same bits for every value; the author's single-stream gain for 1 is +2.2%, one tester, not yet
+# measured here. Not TF_GLM_EXL3_ORDER, which is patch 0020's prompt order (default on).
+export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-0}"
 # Conversations that share a system prompt reuse its prompt state (patch 0015): a 7.9k-token system prompt's second and
 # later chats prefill in 0.13 s instead of 4.24 s. Same replies. SHARED_PREFIX=0 turns it off.
 SHARED_PREFIX="${SHARED_PREFIX:-1}"
@@ -247,6 +317,20 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 case "$TP" in 3) _pool=32 ;; *) _pool=12.5 ;; esac
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
+# The display reservation in the pool (patch 0072, PARALLEL above 1): the GB10 firmware keeps ~2 GiB for a screen that
+# a headless Spark never uses and MemAvailable never counts. DISPLAY_KV_MIB of it (a multiple of 16, at most 2032;
+# 2048 failed ENOMEM in the vLLM kit's #234; 1792 measured here) joins the shared pool on every rank, on top of
+# KV_POOL_GIB, without taking host memory: 1792 adds ~277k tokens at PARALLEL=8 (276,480-278,528 with the pool's size).
+# Same replies, decode and prefill. Headless Sparks only: start.sh and each rank refuse it while a display is connected
+# to card0. Needs /dev/dri/card0 in the containers (nvidia_drm with modeset=1; --gpus all passes it). 0 (default): off.
+DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-0}"
+export TF_GLM_DISPLAY_KV_MIB="$DISPLAY_KV_MIB"
+# Where the span's reservation half comes from (patch 0087): drm (default) maps a DRM dumb buffer on card0, as above;
+# dispram takes it from the dispramd daemon of kindling spark-os, whose nvidia_drm runs without modeset (no dumb
+# buffers: CREATE_DUMB fails ENOSYS) and whose daemon owns the reservation. start.sh mounts dispramd's socket and its
+# python client into every rank for dispram and refuses a Spark without them.
+DISPLAY_KV_BACKEND="${DISPLAY_KV_BACKEND:-drm}"
+export TF_GLM_DISPLAY_KV_BACKEND="$DISPLAY_KV_BACKEND"
 
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 
@@ -284,6 +368,18 @@ log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" 
 warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
 die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 
+# HF_TOKEN from scripts/local.sh reaches the hf CLI and the download container only when exported
+[[ -z "${HF_TOKEN:-}" ]] || export HF_TOKEN
+# need_hf_token: stop before anything else when the checkpoint is the gated Ablit one (ABLIT=1) and HF_TOKEN is not set
+need_hf_token() {
+  [[ "$ABLIT" =~ ^[01]$ ]] || die "ABLIT is 0 or 1, not $ABLIT"
+  [[ "$MODEL_ID" == "$ABLIT_ID" && -z "${HF_TOKEN:-}" ]] || return 0
+  die "The Ablit weights ($ABLIT_ID, ABLIT=1) are gated on Hugging Face.
+    1. Open https://huggingface.co/$ABLIT_ID, log in and agree to its terms.
+    2. Create a token with read access at https://huggingface.co/settings/tokens (the same account).
+    3. Set HF_TOKEN=hf_... in scripts/local.sh, in .env or in the environment, and run this again.
+    Or set ABLIT=0 to serve the published checkpoint."
+}
 model_cache_dir() { local id=${1:-$MODEL_ID}; echo "$HF_CACHE/hub/models--${id//\//--}"; }
 # model_revision <id>: the pinned revision of MODEL_ID or DFLASH2_ID (empty: none, the cache's refs/main counts)
 model_revision() { if [[ "$1" == "$MODEL_ID" ]]; then echo "$MODEL_REVISION"; elif [[ "$1" == "$DFLASH2_ID" ]]; then echo "$DFLASH2_REVISION"; fi; }
@@ -307,3 +403,18 @@ prepared_state() {
   done
   echo "$line"
 }
+
+# Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
+# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
+# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
+# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
+# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
+SPILL_GIB="${SPILL_GIB:-0}"
+SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
+SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
+SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
+SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
+SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
+if [[ "$SPILL_GIB" != 0 ]]; then
+  STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
+fi

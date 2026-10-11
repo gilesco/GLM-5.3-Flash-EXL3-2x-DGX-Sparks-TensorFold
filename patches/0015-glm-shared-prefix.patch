@@ -64,7 +64,7 @@ index cd9a9f1..79a6427 100644
  
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 816d899..2a05621 100644
+index 8766f5d..dbf6eae 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -72,6 +72,84 @@ def grid_point(n: int, cut: int, grid: int) -> int | None:
@@ -161,8 +161,8 @@ index 816d899..2a05621 100644
 +
      def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                   drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                  prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
-@@ -233,6 +314,9 @@ class GlmEngine:
+                  prefill_rows: int | None = None, world: int = 2, vision: bool = False, vision_urls: bool = False,
+@@ -235,6 +316,9 @@ class GlmEngine:
              raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
          # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them
          self.grid = prompt_grid(prefill_rows)
@@ -172,7 +172,7 @@ index 816d899..2a05621 100644
          vision = bool(vision) and rank == 0
          workspace = vision_workspace() if vision else 0
          if vision:                           # the tower's bf16 weights, which the split rule drops
-@@ -266,7 +350,7 @@ class GlmEngine:
+@@ -268,7 +352,7 @@ class GlmEngine:
          # both ranks must run the same calls: refuse to start when they were given different settings
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                  prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
@@ -181,7 +181,7 @@ index 816d899..2a05621 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -276,7 +360,7 @@ class GlmEngine:
+@@ -278,7 +362,7 @@ class GlmEngine:
              raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                 "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
@@ -190,7 +190,7 @@ index 816d899..2a05621 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -321,6 +405,11 @@ class GlmEngine:
+@@ -323,6 +407,11 @@ class GlmEngine:
          if rank == 0 and self.grid:
              print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
                    f"(TF_GLM_PROMPT_GRID)", flush=True)
@@ -202,7 +202,7 @@ index 816d899..2a05621 100644
          if self.drafter is not None:
              self.drafter.capture()
          self.costs = self._calibrate()
-@@ -529,6 +618,7 @@ class GlmEngine:
+@@ -535,6 +624,7 @@ class GlmEngine:
          """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
          from .decode import row_bytes, save_rows
  
@@ -210,7 +210,7 @@ index 816d899..2a05621 100644
          live = self.live
          dropped = False
  
-@@ -542,7 +632,7 @@ class GlmEngine:
+@@ -548,7 +638,7 @@ class GlmEngine:
              if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
                  self._drop(snap)
                  continue
@@ -219,7 +219,7 @@ index 816d899..2a05621 100644
              while self._held_bytes() + need > self.cache_bytes:
                  old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
                  if old is None:
-@@ -553,28 +643,51 @@ class GlmEngine:
+@@ -559,28 +649,51 @@ class GlmEngine:
                  self._drop(snap)
                  dropped = True
                  continue
@@ -275,7 +275,7 @@ index 816d899..2a05621 100644
          from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
          from .drafter_choice import DrafterChoice, auto_decode
  
-@@ -587,7 +700,7 @@ class GlmEngine:
+@@ -593,7 +706,7 @@ class GlmEngine:
          cut = len(hit.ids) if hit is not None else 0
          self._take_over(list(hit.ids) if hit is not None else [])
          if hit is not None and hit.rows is not None:
@@ -284,7 +284,7 @@ index 816d899..2a05621 100644
              hit.rows, hit.nbytes = None, 0            # live again
          # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
          self.live = list(prompt) if feed is None else []
-@@ -596,22 +709,32 @@ class GlmEngine:
+@@ -602,22 +715,32 @@ class GlmEngine:
          # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
          # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
          point = grid_point(len(prompt), cut, self.grid) if draft and feed is None else None
@@ -328,7 +328,7 @@ index 816d899..2a05621 100644
          on_tokens([first])
          if max_tokens <= 1 or (stop_eos and first in self.eos):
              return stats
-@@ -698,12 +821,14 @@ class GlmEngine:
+@@ -704,12 +827,14 @@ class GlmEngine:
              feed = VisionFeed(self, positions, rows)
              feed.encode_s = time.perf_counter() - t
          hit = self._resume(list(prompt), code) if draft and feed is None else None
@@ -344,7 +344,7 @@ index 816d899..2a05621 100644
          from tensorfold.engine.grammar import pack
  
          self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
-@@ -713,7 +838,8 @@ class GlmEngine:
+@@ -719,7 +844,8 @@ class GlmEngine:
              self._share(pack(constraint))
          if positions:
              self._share(positions)
@@ -354,7 +354,7 @@ index 816d899..2a05621 100644
          stats.update(policy=spec, drafts=draft)
          if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
              self.comm.check()
-@@ -765,8 +891,15 @@ class GlmEngine:
+@@ -772,8 +898,15 @@ class GlmEngine:
      def follow(self) -> None:
          """Rank 1: mirror every request rank 0 serves, forever."""
  
@@ -370,7 +370,7 @@ index 816d899..2a05621 100644
          while True:
              self._await_bell()
              header = self._share(None)
-@@ -776,7 +909,8 @@ class GlmEngine:
+@@ -783,7 +916,8 @@ class GlmEngine:
                  self._score_local(prompt, labels)
                  continue
              (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
@@ -380,7 +380,7 @@ index 816d899..2a05621 100644
              prompt = self._share(None)
              packed = self._share(None) if shaped else []
              constraint = None
-@@ -795,7 +929,7 @@ class GlmEngine:
+@@ -802,7 +936,7 @@ class GlmEngine:
                  if hit is None:
                      raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
              self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),

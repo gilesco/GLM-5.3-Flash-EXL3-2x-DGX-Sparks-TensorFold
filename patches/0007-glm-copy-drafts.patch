@@ -349,7 +349,7 @@ index e018386..b14a7e9 100644
 -                        m_rows[:len(m_next)])
 +                        m_rows[:len(m_next)], c_rounds, c_drafted, c_accepted)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 2608819..70752a0 100644
+index 5bce65c..d4bace4 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -141,6 +141,11 @@ class GlmEngine:
@@ -364,7 +364,7 @@ index 2608819..70752a0 100644
          torch.cuda.set_device(0)
          self.torch = torch
          self.rank = rank
-@@ -206,7 +211,7 @@ class GlmEngine:
+@@ -208,7 +213,7 @@ class GlmEngine:
          long_context = self.limit > cfg.dense_limit
          # both ranks must run the same calls: refuse to start when they were given different settings
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
@@ -373,7 +373,7 @@ index 2608819..70752a0 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -214,7 +219,7 @@ class GlmEngine:
+@@ -216,7 +221,7 @@ class GlmEngine:
          both = self._gather_ints(mine + [spare >> 20])
          if both[0][:-1] != both[1][:-1]:
              raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
@@ -382,7 +382,7 @@ index 2608819..70752a0 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -518,6 +523,11 @@ class GlmEngine:
+@@ -524,6 +529,11 @@ class GlmEngine:
          if max_tokens <= 1 or (stop_eos and first in self.eos):
              return stats
          policy = decode_policy(code)
@@ -394,7 +394,7 @@ index 2608819..70752a0 100644
          if policy is None:
              res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
          elif auto:
-@@ -530,13 +540,13 @@ class GlmEngine:
+@@ -536,13 +546,13 @@ class GlmEngine:
                                         margin=margin)
              res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
                                f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
@@ -411,7 +411,7 @@ index 2608819..70752a0 100644
          # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
          if feed is None:
              self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
-@@ -547,6 +557,8 @@ class GlmEngine:
+@@ -553,6 +563,8 @@ class GlmEngine:
              stats.update(drafters=res.arms, keeps=res.keeps)
          if policy is not None:                   # the drafts' counts, which /health, /metrics and the reply report
              stats.update(drafted=res.drafted, accepted=res.accepted)

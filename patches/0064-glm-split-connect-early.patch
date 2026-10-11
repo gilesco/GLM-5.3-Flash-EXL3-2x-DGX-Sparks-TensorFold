@@ -1,8 +1,8 @@
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 89fec6a..7e77d11 100644
+index b916582..44f4a58 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -590,6 +590,14 @@ class GlmEngine:
+@@ -593,6 +593,14 @@ class GlmEngine:
              raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
                               "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
                               "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
@@ -14,6 +14,6 @@ index 89fec6a..7e77d11 100644
 +            a = torch.zeros((1,), dtype=torch.float32, device="cuda")
 +            self.comm.exchange([a], [torch.empty_like(a)], 1 - rank)
 +            torch.cuda.synchronize()
-         w = load(model_dir, rank=rank, mtp=self.mtp_on)
+         w = load(model_dir, rank=rank, mtp=self.mtp_on, world=self.world)
          w.comm = self.comm
          self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL

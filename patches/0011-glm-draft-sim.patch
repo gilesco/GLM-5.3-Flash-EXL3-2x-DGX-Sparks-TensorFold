@@ -984,10 +984,10 @@ index 0000000..64d4f54
 +if __name__ == "__main__":
 +    sys.exit(main())
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 11686a6..0b9cd13 100644
+index 4a72e6d..75466ce 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -252,10 +252,17 @@ class GlmEngine:
+@@ -254,10 +254,17 @@ class GlmEngine:
          self.limit = self.capacity_plan["context_window"]
          capacity = self.capacity_plan["cache_slots"]
          long_context = self.limit > cfg.dense_limit
@@ -1007,7 +1007,7 @@ index 11686a6..0b9cd13 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -264,7 +271,8 @@ class GlmEngine:
+@@ -266,7 +273,8 @@ class GlmEngine:
          if both[0][:-1] != both[1][:-1]:
              raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, "
@@ -1017,7 +1017,7 @@ index 11686a6..0b9cd13 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -299,6 +307,12 @@ class GlmEngine:
+@@ -301,6 +309,12 @@ class GlmEngine:
              self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
              if rank == 0:
                  print(f"[tensorfold] {self.split.describe()}", flush=True)
@@ -1030,7 +1030,7 @@ index 11686a6..0b9cd13 100644
          if rank == 0 and self.grid:
              print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
                    f"(TF_GLM_PROMPT_GRID)", flush=True)
-@@ -601,6 +615,16 @@ class GlmEngine:
+@@ -607,6 +621,16 @@ class GlmEngine:
              copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
          if policy is None:
              res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
@@ -1082,7 +1082,7 @@ index 6377c42..3c40295 100644
      return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
  
 diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
-index 12c1e3b..1f31287 100644
+index e4478a5..0e7f89f 100644
 --- tensorfold/families/glm5_next/cuda/weights.py
 +++ tensorfold/families/glm5_next/cuda/weights.py
 @@ -13,7 +13,8 @@ from tensorfold.cuda import experts as grouped
@@ -1095,7 +1095,7 @@ index 12c1e3b..1f31287 100644
  
  PREFIX = "model.language_model."
  
-@@ -441,7 +442,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -440,7 +441,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
          if exl3:
              raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
              head = dense(raw)
@@ -1105,33 +1105,3 @@ index 12c1e3b..1f31287 100644
          else:
              hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
              head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
-diff --git tensorfold/families/glm5_next/cuda/weights.py.orig tensorfold/families/glm5_next/cuda/weights.py.orig
-index f551104..12c1e3b 100644
---- tensorfold/families/glm5_next/cuda/weights.py.orig
-+++ tensorfold/families/glm5_next/cuda/weights.py.orig
-@@ -280,15 +280,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
-         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
- 
-     # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
--    fp8 = exl3 and dense_kind() == "fp8"
-+    fp8 = exl3 and dense_kind() in ("fp8", "q4")
-     dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
-+    # TF_GLM_DENSE=q4: the projections in 4 bits (MSE-searched groups of 64), the head and kv_b in FP8
-+    if exl3 and dense_kind() == "q4":
-+        from .qmm import make_dense_q4, stack_dense_q4
-+
-+        big, big_stack = make_dense_q4, stack_dense_q4
-+    else:
-+        big, big_stack = dense, dense_stack
- 
-     def q4(name: str) -> Q4 | B16 | F8:
--        return dense(t(name + ".weight")) if exl3 else make_q4(*trip(name))
-+        return big(t(name + ".weight")) if exl3 else make_q4(*trip(name))
- 
-     def stack(names: list[str]) -> Q4 | B16 | F8:
-         if exl3:
--            return dense_stack([t(n + ".weight") for n in names])
-+            return big_stack([t(n + ".weight") for n in names])
-         return stack_q4([trip(n) for n in names])
- 
-     def hc(i: int, site: str) -> HCW:

@@ -1,0 +1,34 @@
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 24d3e6f..35409ed 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -729,13 +729,23 @@ class MultiDecoder:
+         base = None
+         if hit is not None and hit.extent.owner is None:
+             x = hit.extent
+-            for c in list(x.kept):            # kept prompts the stream would overwrite: gone
+-                if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key:
++            # kept prompts the stream would overwrite: another conversation's longer states in the same rows (a shared
++            # system prompt's state lives in the extent of the conversation that wrote it). Copy the shared rows into
++            # an extent of their own instead, so that conversation keeps its state. Only into free rows: evicting other
++            # conversations to make room would cost more than it saves, so then the rows are overwritten as before.
++            # Not with TF_GLM_MULTI_LONE=1: the copy, decoding alone, would move home to the pool's first rows and evict
++            # the writer's whole extent there, the shared state included.
++            others = [c for c in x.kept if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key]
++            if others and not self.tune.lone:
++                base = self.pool.place(need)
++                copy = int(base is not None)
++            if base is None:
++                for c in others:
+                     self._evict(c)
+-            if self._grow(x, need, protect=[x]):
+-                base = x.base
+-            else:
+-                hit = None
++                if self._grow(x, need, protect=[x]):
++                    base = x.base
++                else:
++                    hit = None
+         if base is None:
+             base = self._room(need, [hit.extent] if hit is not None else [])
+             if base is None and hit is not None:          # no room beside the kept rows: start fresh

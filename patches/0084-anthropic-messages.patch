@@ -1,0 +1,74 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index fc6253b..c66f4fb 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -8,7 +8,11 @@ import uuid
+ from typing import TYPE_CHECKING, Any
+ 
+ from tensorfold.cuda import health
++<<<<<<< ours
+ from tensorfold.server import anthropic, metrics, responses, token_routes
++=======
++from tensorfold.server import anthropic, metrics, responses
++>>>>>>> theirs
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.decisions import DecisionError
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+@@ -109,9 +113,12 @@ def make_handler(app: App):
+             responses.delete(self, app, responses.route(self.path))
+ 
+         def do_POST(self):
++<<<<<<< ours
+             path = self.path.split("?", 1)[0].rstrip("/")
+             if path.endswith("/decisions"):
+                 return self._post_decisions()
++=======
++>>>>>>> theirs
+             if anthropic.route(self.path):
+                 return anthropic.post(self, app)
+             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
+@@ -255,6 +262,7 @@ def make_handler(app: App):
+                            "usage": usage, "tensorfold": result["stats"]}
+             if result.get("stop_sequence") is not None:
+                 payload["stop_sequence"] = result["stop_sequence"]
++<<<<<<< ours
+             self._json(200, payload)
+ 
+         def _post_decisions(self) -> None:
+@@ -281,6 +289,8 @@ def make_handler(app: App):
+                     return self._json(500, {"error": {"message": _error_message(exc)}})
+                 except OSError:
+                     return
++=======
++>>>>>>> theirs
+             self._json(200, payload)
+ 
+     from tensorfold.server.auth_http import handler
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index a7237b8..e9ac643 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -18,8 +18,11 @@ from tensorfold.server.messages import validate_modalities
+ from tensorfold.server.probabilities import TokenBytes, probability_options
+ from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
+ from tensorfold.server.stopping import matched_stop, stop_options
++<<<<<<< ours
+ from tensorfold.server.thinking_notes import unanswered
+ from tensorfold.server.token_routes import flag, token_ids
++=======
++>>>>>>> theirs
+ from tensorfold.server.tool_policy import ToolCallPolicy
+ from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+ from tensorfold.engine.tool_draft import ToolCallStreamer
+@@ -649,7 +652,11 @@ class App:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+         text = stops.visible(raw_text) + closing[0]
++<<<<<<< ours
+         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
++=======
++        raw_answer = split(text, True)[1]
++>>>>>>> theirs
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+         call_deltas, streamed = [], 0

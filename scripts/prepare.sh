@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Prepare both Sparks to serve Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold with TensorFold (two ranks; with TP=3,
-# both workers the same way, each per its own WORKER_WEIGHTS / WORKER_WEIGHTS2):
+# Prepare both Sparks to serve Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (with ABLIT=1, the gated
+# Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit, which needs HF_TOKEN) with TensorFold (two ranks; with TP=3, both
+# workers the same way, each per its own WORKER_WEIGHTS / WORKER_WEIGHTS2):
 #   1. preflight checks: docker and the GPU on both nodes, key-based ssh to the worker, the RoCE link, disk space
 #   2. the image on the head: TensorFold plus patches/*.patch on NVIDIA's PyTorch container, pulled prebuilt from
 #      $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else built locally
@@ -25,6 +26,7 @@ for arg in "$@"; do
     *) die "unknown argument: $arg" ;;
   esac
 done
+need_hf_token                        # ABLIT=1 (gated weights) without HF_TOKEN: say so before anything else
 
 # ---------------------------------------------------------------- 1. preflight
 mkdir -p "$KERNEL_CACHE" "$STATE_DIR" "$HF_CACHE/hub"
@@ -32,6 +34,26 @@ exec 9>"$STATE_DIR/prepare.lock"
 flock -n 9 || die "another prepare.sh is already running (it holds the download locks); wait for it or stop it: pgrep -af prepare.sh"
 SPARKS="both Sparks"; (( TP == 2 )) || SPARKS="all $TP Sparks"
 log "Preflight checks on $SPARKS"
+# The gated Ablit weights (ABLIT=1): HF_TOKEN must reach their files, which takes the token's account having accepted
+# the terms on the model's page. Asked for one small file before the image work, so a refusal says why at once instead
+# of failing the download later. The header goes to curl on stdin, keeping the token out of the process list. No
+# answer from the Hub (offline): left to the download, which falls back on a snapshot already here.
+if [[ "$MODEL_ID" == "$ABLIT_ID" ]]; then
+  _url="https://huggingface.co/$MODEL_ID/resolve/${MODEL_REVISION:-main}/config.json"
+  code=$(printf 'Authorization: Bearer %s\n' "$HF_TOKEN" |
+    curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H @- "$_url" || true)
+  case "$code" in
+    2??|3??) log "HF_TOKEN reaches the gated $MODEL_ID" ;;
+    401) die "Hugging Face does not accept HF_TOKEN (401): $MODEL_ID is gated; create a token with read access at
+    https://huggingface.co/settings/tokens and set HF_TOKEN=hf_... in scripts/local.sh, .env or the environment" ;;
+    403) die "HF_TOKEN may not read $MODEL_ID yet (403): it is gated; open https://huggingface.co/$MODEL_ID, log in
+    with the token's account and agree to its terms (a fine-grained token also needs read access to public gated
+    repositories), then run this again" ;;
+    404) die "Hugging Face has no $MODEL_ID @ ${MODEL_REVISION:-main} (404): check MODEL_REVISION" ;;
+    000) warn "could not reach Hugging Face to check HF_TOKEN against the gated $MODEL_ID; trying the download" ;;
+    *) warn "Hugging Face answered HTTP $code when checking HF_TOKEN against the gated $MODEL_ID; trying the download" ;;
+  esac
+fi
 command -v docker >/dev/null || die "docker is not installed"
 command -v rsync >/dev/null || die "rsync is not installed on this node (sudo apt install rsync)"
 docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"

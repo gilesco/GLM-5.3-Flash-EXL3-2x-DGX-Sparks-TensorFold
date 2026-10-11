@@ -97,7 +97,7 @@ index 0f9dae5..7f8b46f 100644
      return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 84be913..111339d 100644
+index 13a278a..ba6ada9 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -20,10 +20,10 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
@@ -115,8 +115,8 @@ index 84be913..111339d 100644
  
  
  def vision_workspace() -> int:
-@@ -163,6 +163,13 @@ class GlmEngine:
-         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+@@ -165,6 +165,13 @@ class GlmEngine:
+             weights_estimate = fp8_weights(weights_estimate)
          if not self.mtp_on:
              weights_estimate = without_mtp(weights_estimate, cfg.layers)
 +        # rows a prompt chunk runs at once: TF_GLM_PREFILL_ROWS (both ranks alike), more amortizes each chunk's expert
@@ -129,17 +129,17 @@ index 84be913..111339d 100644
          vision = bool(vision) and rank == 0
          workspace = vision_workspace() if vision else 0
          if vision:                           # the tower's bf16 weights, which the split rule drops
-@@ -175,7 +182,8 @@ class GlmEngine:
+@@ -177,7 +184,8 @@ class GlmEngine:
          def geometry(text):
              from tensorfold.cuda.capacity import Geometry
  
--            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.mtp_on)
-+            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
-+                             mtp=self.mtp_on)
+-            g = mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.mtp_on)
++            g = mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT,
++                             prefill_rows=prefill_rows, mtp=self.mtp_on)
              return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
          self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                     geometry,
-@@ -186,7 +194,6 @@ class GlmEngine:
+@@ -188,7 +196,6 @@ class GlmEngine:
          capacity = self.capacity_plan["cache_slots"]
          long_context = self.limit > cfg.dense_limit
          # both ranks must run the same calls: refuse to start when they were given different settings
@@ -147,7 +147,7 @@ index 84be913..111339d 100644
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                  prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
-@@ -555,7 +562,11 @@ class GlmEngine:
+@@ -561,7 +568,11 @@ class GlmEngine:
              if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
                  raise ValueError("image rows must sit at increasing positions inside the prompt")
              t = time.perf_counter()

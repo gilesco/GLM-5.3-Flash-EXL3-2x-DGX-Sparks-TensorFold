@@ -1,20 +1,19 @@
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index e6c4d2a..220a36a 100644
+index 2d7dd67..0e06f03 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -136,9 +136,14 @@ class GlmEngine:
+@@ -138,9 +138,14 @@ class GlmEngine:
          explicit = context is not None if context_explicit is None else bool(context_explicit)
          from . import LATENT
  
 +        from .qmm import dense_kind, fp8_weights
 +
-+        # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
-+        weights_estimate = split_weights(rule)
-+        if cfg.quant == "exl3" and dense_kind() == "fp8":
-+            weights_estimate = fp8_weights(weights_estimate)
          # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
          self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
--        weights_estimate = split_weights(rule)
+         weights_estimate = split_weights(rule, self.world)
++        # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
++        if cfg.quant == "exl3" and dense_kind() == "fp8":
++            weights_estimate = fp8_weights(weights_estimate)
          if not self.mtp_on:
              weights_estimate = without_mtp(weights_estimate, cfg.layers)
          self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
@@ -267,7 +266,7 @@ index a366806..827db2b 100644
 +        return total, extra
 +    return transform
 diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
-index 5f81a7b..f551104 100644
+index 90d5c84..4a532a4 100644
 --- tensorfold/families/glm5_next/cuda/weights.py
 +++ tensorfold/families/glm5_next/cuda/weights.py
 @@ -13,7 +13,7 @@ from tensorfold.cuda import experts as grouped
@@ -297,7 +296,7 @@ index 5f81a7b..f551104 100644
                  for v in vars(t).values():
                      add(v)
              elif isinstance(t, (list, tuple)):
-@@ -279,12 +279,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -278,12 +278,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
      def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
          return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
  
@@ -318,7 +317,7 @@ index 5f81a7b..f551104 100644
          return stack_q4([trip(n) for n in names])
  
      def hc(i: int, site: str) -> HCW:
-@@ -305,7 +309,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -304,7 +308,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
          krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
          if exl3:
              w = t(p + "kv_b_proj.weight")
@@ -327,7 +326,7 @@ index 5f81a7b..f551104 100644
              full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
          else:
              w, s, b = trip(p + "kv_b_proj")
-@@ -428,9 +432,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -427,9 +431,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
          vl = cfg.vocab // world
          draft_head = None
          if exl3:

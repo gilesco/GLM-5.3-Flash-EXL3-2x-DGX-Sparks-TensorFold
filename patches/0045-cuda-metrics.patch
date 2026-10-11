@@ -1,5 +1,5 @@
 diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
-index e0d2be2..8e1abb2 100644
+index 3b511f6..5f2a9b0 100644
 --- tensorfold/server/metrics.py
 +++ tensorfold/server/metrics.py
 @@ -15,10 +15,12 @@ from typing import Any
@@ -15,18 +15,18 @@ index e0d2be2..8e1abb2 100644
  
  
  class Histogram:
-@@ -149,8 +151,8 @@ def render(app: Any) -> str:
-         prompt, generation = metrics.prompt, metrics.generation
+@@ -160,8 +162,8 @@ def render(app: Any) -> str:
          drafted, accepted = metrics.drafted, metrics.accepted
          latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
+         requests = dict(metrics.http_requests)
 -    running, waiting = _requests(app)
 -    pools = _pools(app)
 +    running, waiting = _read(lambda: _requests(app), (0, 0))
 +    pools = _read(lambda: _pools(app), [])
      lines: list[str] = []
-     _family(lines, "requests_running", "gauge", "Requests in prefill or decode.",
-             [f"{PREFIX}requests_running {running}"])
-@@ -163,6 +165,7 @@ def render(app: Any) -> str:
+     if requests:
+         _family(lines, "requests_total", "counter", "HTTP replies by API key label and status.",
+@@ -178,6 +180,7 @@ def render(app: Any) -> str:
      _family(lines, "kv_cache_usage_ratio", "gauge",
              "Tokens in a stream cache divided by that stream's context window.",
              [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in pools])
@@ -34,7 +34,7 @@ index e0d2be2..8e1abb2 100644
      _family(lines, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.",
              [f"{PREFIX}mtp_drafted_total {drafted}"])
      _family(lines, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.",
-@@ -207,6 +210,7 @@ def render(app: Any) -> str:
+@@ -222,6 +225,7 @@ def render(app: Any) -> str:
      if preempted is not None:
          _family(lines, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.",
                  [f"{PREFIX}preemptions_total {preempted}"])
@@ -42,7 +42,7 @@ index e0d2be2..8e1abb2 100644
      return "\n".join(lines) + "\n"
  
  
-@@ -214,18 +218,75 @@ def send(handler: Any, app: Any) -> None:
+@@ -229,18 +233,75 @@ def send(handler: Any, app: Any) -> None:
      """Write ``render`` as Prometheus text, version 0.0.4."""
  
      body = render(app).encode()
@@ -124,7 +124,7 @@ index e0d2be2..8e1abb2 100644
      lines.append(f"# HELP {full} {help_text}")
      lines.append(f"# TYPE {full} {kind}")
      lines.extend(samples)
-@@ -313,7 +374,9 @@ def _pools(app: Any) -> list[tuple[str, float]]:
+@@ -328,7 +389,9 @@ def _pools(app: Any) -> list[tuple[str, float]]:
  def _window(app: Any) -> int:
      engine = getattr(app, "engine", None)
      decoder = getattr(getattr(engine, "scheduler", None), "decoder", None) if engine is not None else None
@@ -135,7 +135,7 @@ index e0d2be2..8e1abb2 100644
          n = _positive(getattr(owner, name, None) if owner is not None else None)
          if n:
              return n
-@@ -334,16 +397,14 @@ def _lengths(app: Any) -> list[int]:
+@@ -349,16 +412,14 @@ def _lengths(app: Any) -> list[int]:
  
  
  def _occupied(stream: Any) -> int:
@@ -156,7 +156,7 @@ index e0d2be2..8e1abb2 100644
  
  
  def _positive(value: Any) -> int:
-@@ -364,5 +425,5 @@ def _edge(value: float) -> str:
+@@ -379,5 +440,5 @@ def _edge(value: float) -> str:
      return f"{value:.4f}".rstrip("0").rstrip(".")
  
  

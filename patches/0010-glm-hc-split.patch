@@ -37,15 +37,15 @@ index b16ad04..c75f90c 100644
          self.st = State(w, capacity, max_rows)
          self.last_hidden: torch.Tensor | None = None
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 37f4679..11686a6 100644
+index d81e9c9..4a72e6d 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -160,9 +160,11 @@ class GlmEngine:
  
      def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                   drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
--                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False) -> None:
-+                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
+-                 prefill_rows: int | None = None, world: int = 2, vision: bool = False, vision_urls: bool = False) -> None:
++                 prefill_rows: int | None = None, world: int = 2, vision: bool = False, vision_urls: bool = False,
 +                 split=None) -> None:
          """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
 -        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows)."""
@@ -66,7 +66,7 @@ index 37f4679..11686a6 100644
          torch.cuda.set_device(0)
          self.torch = torch
          self.rank = rank
-@@ -247,7 +254,7 @@ class GlmEngine:
+@@ -249,7 +256,7 @@ class GlmEngine:
          long_context = self.limit > cfg.dense_limit
          # both ranks must run the same calls: refuse to start when they were given different settings
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
@@ -75,7 +75,7 @@ index 37f4679..11686a6 100644
              [int(self.mtp_on), int(DRAFT_RING)]
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
-@@ -256,8 +263,8 @@ class GlmEngine:
+@@ -258,8 +265,8 @@ class GlmEngine:
          both = self._gather_ints(mine + [spare >> 20])
          if both[0][:-1] != both[1][:-1]:
              raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
@@ -86,7 +86,7 @@ index 37f4679..11686a6 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -287,7 +294,11 @@ class GlmEngine:
+@@ -289,7 +296,11 @@ class GlmEngine:
              self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
          self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
                          long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),

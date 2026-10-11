@@ -139,7 +139,7 @@ index 62c9373..25947bb 100644
 +                              round_ms=round_ms)
          return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 2a05621..3c14034 100644
+index dbf6eae..fd67051 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -151,11 +151,16 @@ def user_opener(model_dir: Path) -> int | None:
@@ -226,7 +226,7 @@ index 2a05621..3c14034 100644
  def _f64_ints(x: float) -> list[int]:
      return list(struct.unpack("<2i", struct.pack("<d", float(x))))
  
-@@ -738,7 +780,7 @@ class GlmEngine:
+@@ -744,7 +786,7 @@ class GlmEngine:
          on_tokens([first])
          if max_tokens <= 1 or (stop_eos and first in self.eos):
              return stats

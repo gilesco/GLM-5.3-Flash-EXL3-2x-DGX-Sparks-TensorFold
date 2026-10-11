@@ -1,15 +1,19 @@
 diff --git tensorfold/cli.py tensorfold/cli.py
-index 5868baf..cc3d273 100644
+index 930f164..0c3f6f4 100644
 --- tensorfold/cli.py
 +++ tensorfold/cli.py
-@@ -242,10 +242,14 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+@@ -243,14 +243,14 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
  
      from tensorfold import hub
  
--    if args.tp == 2 and not args.master:
--        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+-    if args.tp > 1 and not args.master:
+-        raise ValueError("--tp 2/4 needs --master: rank 0's address on the link between the ranks")
 -    if args.tp == 1 and args.rank != 0:
--        raise ValueError("--rank 1 needs --tp 2")
+-        raise ValueError("--rank 1 needs --tp 2 or 4")
+-    if args.rank >= args.tp:
+-        raise ValueError(f"--rank {args.rank} needs --tp {args.rank + 1} or more")
+-    if args.tp == 4 and not getattr(family.package, "CUDA_TP4", False):
+-        raise ValueError(f"--tp 4: {family.title} runs on one or two GPUs on CUDA")
 +    tp, rank = int(args.tp), int(args.rank)
 +    if tp > 1 and not args.master:
 +        raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
@@ -21,44 +25,43 @@ index 5868baf..cc3d273 100644
      started = time.perf_counter()
      drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
      options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
-@@ -269,7 +273,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+@@ -274,7 +274,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
      if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
          options["checkpoint_slots"] = int(args.checkpoint_slots)
      served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
--    where = f", rank {args.rank} of 2" if args.tp == 2 else ""
+-    where = f", rank {args.rank} of {args.tp}" if args.tp > 1 else ""
 +    where = f", rank {rank} of {tp}" if tp > 1 else ""
      print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
      from tensorfold.cuda import precision, prompt_precision
  
-@@ -287,8 +291,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+@@ -292,8 +292,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
          raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
                           "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
      stacks.arm()            # its warmup may have loaded a compiler that took USR1
--    if args.tp == 2 and args.rank == 1:
--        print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
+-    if args.tp > 1 and args.rank != 0:
+-        print(f"[tensorfold] rank {args.rank} ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
 +    if tp > 1 and rank > 0:
 +        print(f"[tensorfold] rank {rank} ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
          engine.follow()
          return 0
      from tensorfold.cuda.server import App, serve
 diff --git tensorfold/cli_args.py tensorfold/cli_args.py
-index 671910e..53e12bd 100644
+index 7f8e419..7d2826f 100644
 --- tensorfold/cli_args.py
 +++ tensorfold/cli_args.py
-@@ -122,12 +122,13 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
+@@ -129,12 +129,13 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
      cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
      cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                        help="auto: MLX on macOS, CUDA elsewhere")
--    cuda.add_argument("--tp", type=int, choices=(1, 2), default=1,
+-    cuda.add_argument("--tp", type=int, choices=(1, 2, 4), default=1,
 -                      help="GPUs (one per machine) the model is split over; run the same command on each")
--    cuda.add_argument("--rank", type=int, choices=(0, 1), default=0,
--                      help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
--    cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
--    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
 +    cuda.add_argument("--tp", type=int, choices=(1, 2, 3, 4), default=1,
 +                      help="GPUs (one per machine) the model is split over; run the same command on each "
 +                           "(3 and 4: GLM-5.3-Flash only)")
-+    cuda.add_argument("--rank", type=int, choices=(0, 1, 2, 3), default=0,
+     cuda.add_argument("--rank", type=int, choices=(0, 1, 2, 3), default=0,
+-                      help="with --tp 2/4: this machine's rank; rank 0 serves HTTP, others follow it")
+-    cuda.add_argument("--master", default="", help="with --tp 2/4: rank 0's address on the link between the ranks")
+-    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2/4: rank 0's rendezvous port")
 +                      help="with --tp N: this machine's rank, 0 to N-1; rank 0 serves HTTP, the others follow it")
 +    cuda.add_argument("--master", default="", help="with --tp N: rank 0's address on the link between the machines")
 +    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp N: rank 0's rendezvous port")
@@ -124,265 +127,6 @@ index 2b8efe8..574ebdf 100644
      def barrier(self) -> None:
          x = torch.zeros((1,), dtype=torch.float32, device="cuda")
          y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
-diff --git tensorfold/cuda/comm.py.orig tensorfold/cuda/comm.py.orig
-new file mode 100644
-index 0000000..ecfb979
---- /dev/null
-+++ tensorfold/cuda/comm.py.orig
-@@ -0,0 +1,253 @@
-+"""NCCL all-gather (and paired send/receive) on the current stream so CUDA graphs capture it; a rank-order sum after
-+it keeps ranks bit-equal."""
-+
-+from __future__ import annotations
-+
-+import ctypes
-+import ctypes.util
-+import glob
-+import os
-+from collections.abc import Callable
-+from typing import Protocol
-+
-+import torch
-+
-+_DTYPES = {torch.float32: 7, torch.bfloat16: 9, torch.int32: 2, torch.int64: 4,
-+           torch.uint8: 1, torch.int8: 0, torch.float16: 6}
-+BACKEND_ENV = "TF_COMM_BACKEND"
-+
-+
-+class Comm(Protocol):
-+    """What every engine assumes; ``all_gather_fast``, ``exchange``, ``check`` (and NCCL's ``store``) are optional."""
-+
-+    rank: int
-+    world: int
-+
-+    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None: ...
-+
-+    def barrier(self) -> None: ...
-+
-+
-+class _UniqueId(ctypes.Structure):
-+    _fields_ = [("internal", ctypes.c_byte * 128)]
-+
-+
-+def _library() -> ctypes.CDLL:
-+    if os.name == "nt":
-+        raise RuntimeError("TensorFold does not run tensor-parallel (NCCL) on Windows: CUDA on Windows has no "
-+                           "libnccl to wrap; use one GPU per process there")
-+    candidates = [os.environ.get("TF_NCCL_LIB", "")]
-+    found = ctypes.util.find_library("nccl")
-+    if found:
-+        candidates.append(found)
-+    candidates += glob.glob("/usr/lib/*/libnccl.so.2") + glob.glob("/usr/local/lib/python3*/dist-packages/nvidia/nccl/lib/libnccl.so.2")
-+    candidates += glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "libnccl*.so*"))
-+    for path in candidates:
-+        if path:
-+            try:
-+                return ctypes.CDLL(path)
-+            except OSError:
-+                continue
-+    raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
-+
-+
-+class NCCL:
-+    def __init__(self, rank: int, world: int, master: str, port: int, *, timeout_s: float = 600,
-+                 key: str = "tf_nccl_uid") -> None:
-+        from datetime import timedelta
-+
-+        from torch.distributed import TCPStore
-+
-+        self.rank, self.world = rank, world
-+        self.lib = _library()
-+        lib = self.lib
-+        lib.ncclGetErrorString.restype = ctypes.c_char_p
-+        lib.ncclGetErrorString.argtypes = [ctypes.c_int]
-+        lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(_UniqueId)]
-+        lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
-+        lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
-+                                      ctypes.c_void_p]
-+        self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
-+        uid = _UniqueId()
-+        if rank == 0:
-+            self._check(self.lib.ncclGetUniqueId(ctypes.byref(uid)))
-+            self.store.set(key, bytes(uid.internal))
-+        else:
-+            raw = self.store.get(key)
-+            ctypes.memmove(ctypes.addressof(uid), raw, 128)
-+        self.comm = ctypes.c_void_p()
-+        torch.cuda.current_device()
-+        self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
-+
-+    def _check(self, code: int) -> None:
-+        if code != 0:
-+            raise RuntimeError(f"NCCL error {code}: {self.lib.ncclGetErrorString(code).decode()}")
-+
-+    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
-+        """recv [world * n] <- every rank's send [n], in rank order (contiguous tensors, same dtype)."""
-+
-+        if recv.numel() != send.numel() * self.world or send.dtype != recv.dtype:
-+            raise ValueError("all_gather: recv must hold world x send of the same dtype")
-+        stream = torch.cuda.current_stream().cuda_stream
-+        self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
-+                                           self.comm, stream))
-+
-+    def ready(self, label: str, *, every: float = 60.0, timeout: float = 3600.0) -> None:
-+        """Every rank finishes ``label`` before any goes on; a rank missing after ``timeout`` s is named."""
-+
-+        import time
-+        from datetime import timedelta
-+
-+        self.store.set(f"tf_ready/{label}/{self.rank}", "1")
-+        others = [r for r in range(self.world) if r != self.rank]
-+        started = time.monotonic()
-+        while True:
-+            try:
-+                self.store.wait([f"tf_ready/{label}/{r}" for r in others], timedelta(seconds=every))
-+                return
-+            except Exception as exc:                  # noqa: BLE001  (the store's timeout; anything else goes up)
-+                if "timeout" not in str(exc).lower():
-+                    raise
-+            waited = time.monotonic() - started
-+            missing = ", ".join(str(r) for r in others)
-+            if waited >= timeout:
-+                raise RuntimeError(f"rank {self.rank} finished {label} but rank {missing} has not after "
-+                                   f"{waited / 60:.0f} min: check that rank's log (a CUDA extension build waiting on "
-+                                   "a lock names the lock there)")
-+            print(f"[tensorfold] rank {self.rank} finished {label}; waiting for rank {missing} ({waited:.0f} s)",
-+                  flush=True)
-+
-+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
-+        """One NCCL group with ``peer``: each ``sends[i]`` lands in the peer's ``recvs[i]`` (contiguous tensors)."""
-+
-+        if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
-+            raise ValueError("exchange: one receive per send, with another rank")
-+        lib = self.lib
-+        if not getattr(self, "_p2p", False):
-+            for name in ("ncclSend", "ncclRecv"):
-+                getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-+                                               ctypes.c_void_p, ctypes.c_void_p]
-+            lib.ncclGroupStart.argtypes = []
-+            lib.ncclGroupEnd.argtypes = []
-+            self._p2p = True
-+        stream = torch.cuda.current_stream().cuda_stream
-+        self._check(lib.ncclGroupStart())
-+        try:
-+            for s, r in zip(sends, recvs):
-+                if s.numel():
-+                    self._check(lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
-+                if r.numel():
-+                    self._check(lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
-+        finally:
-+            self._check(lib.ncclGroupEnd())
-+
-+    def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
-+        """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
-+        ``recvs[p][i]`` from it (an all-to-all of row blocks; each peer's matching call names this rank with the
-+        same sizes and dtypes in the same order)."""
-+
-+        if set(sends) != set(recvs) or any(p == self.rank or not 0 <= p < self.world for p in sends):
-+            raise ValueError("exchange_all: sends and receives with the same other ranks")
-+        for p in sends:
-+            if len(sends[p]) != len(recvs[p]):
-+                raise ValueError("exchange_all: one receive per send")
-+            for s, r in zip(sends[p], recvs[p]):
-+                if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
-+                    raise ValueError("exchange_all: each send and receive must be contiguous and alike")
-+        stream = torch.cuda.current_stream().cuda_stream
-+        self._check(self.lib.ncclGroupStart())
-+        try:
-+            for p in sorted(sends):
-+                for s, r in zip(sends[p], recvs[p]):
-+                    if s.numel():
-+                        self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, self.comm, stream))
-+                        self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, self.comm, stream))
-+        finally:
-+            self._check(self.lib.ncclGroupEnd())
-+
-+    def barrier(self) -> None:
-+        x = torch.zeros((1,), dtype=torch.float32, device="cuda")
-+        y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
-+        self.all_gather(x, y)
-+        torch.cuda.synchronize()
-+
-+
-+def fast_gather(comm: Comm, send: torch.Tensor, recv: torch.Tensor) -> None:
-+    """A model exchange: the communicator's faster ``all_gather_fast`` if it has one, else ``all_gather``."""
-+
-+    fast = getattr(comm, "all_gather_fast", None)
-+    if fast is None:
-+        comm.all_gather(send, recv)
-+    else:
-+        fast(send, recv)
-+
-+
-+def check(comm: Comm) -> None:
-+    """Raise a failure the communicator's transport recorded (call it after a synchronizing exchange)."""
-+
-+    found = getattr(comm, "check", None)
-+    if found is not None:
-+        found()
-+
-+
-+def exchange(comm: Comm, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int | None = None) -> None:
-+    """``comm.exchange`` when it has one, else (two ranks) each pair traded as bytes through the all-gather."""
-+
-+    peer = 1 - comm.rank if peer is None else peer
-+    if len(sends) != len(recvs):
-+        raise ValueError("exchange: one receive per send")
-+    fn = getattr(comm, "exchange", None)
-+    if fn is not None:
-+        fn(sends, recvs, peer)
-+        return
-+    if comm.world != 2:
-+        raise ValueError("exchange: a communicator without exchange trades through its all-gather, two ranks only")
-+    if peer == comm.rank or not 0 <= peer < comm.world:
-+        raise ValueError("exchange: the peer must be another rank")
-+    for s, r in zip(sends, recvs):
-+        sb, rb = s.contiguous().view(-1).view(torch.uint8), r.view(-1).view(torch.uint8)
-+        n = max(sb.numel(), rb.numel())
-+        if n == 0:
-+            continue
-+        pad = torch.zeros((n,), dtype=torch.uint8, device=s.device)
-+        pad[:sb.numel()].copy_(sb)
-+        both = torch.empty((2 * n,), dtype=torch.uint8, device=s.device)
-+        comm.all_gather(pad, both)
-+        rb.copy_(both[peer * n:peer * n + rb.numel()])
-+
-+
-+class Transport:
-+    """A base for transports: whatever a subclass does not define (``store``, ``ready``, ...) is the wrapped NCCL's."""
-+
-+    def __init__(self, base: Comm) -> None:
-+        self.base, self.rank, self.world = base, base.rank, base.world
-+
-+    def __getattr__(self, name: str):
-+        if name == "base":                          # not set yet (a copy): no recursion
-+            raise AttributeError(name)
-+        return getattr(self.base, name)
-+
-+
-+BACKENDS: dict[str, Callable[[Comm], Comm]] = {}
-+
-+
-+def register_backend(name: str, wrap: Callable[[Comm], Comm]) -> None:
-+    """A transport over NCCL (still the control channel): ``wrap(nccl)`` runs on every rank at once."""
-+
-+    BACKENDS[name] = wrap
-+
-+
-+def open_comm(rank: int, world: int, master: str, port: int, *, backend: str | None = None, **nccl) -> Comm:
-+    """NCCL, wrapped by ``backend`` (default TF_COMM_BACKEND, else none); the ranks check they named the same one."""
-+
-+    name = (backend if backend is not None else os.environ.get(BACKEND_ENV, "")).strip().lower() or "nccl"
-+    if name != "nccl" and name not in BACKENDS:
-+        raise ValueError(f"{BACKEND_ENV}={name!r}: expected nccl{''.join(', ' + b for b in sorted(BACKENDS))}")
-+    base = NCCL(rank, world, master, port, **nccl)
-+    store = getattr(base, "store", None)
-+    if store is not None and world > 1:          # a transport on one rank only would hang the first exchange
-+        store.set(f"tf_comm_backend/{rank}", name)
-+        names = [store.get(f"tf_comm_backend/{r}").decode() for r in range(world)]
-+        if len(set(names)) > 1:
-+            raise RuntimeError(f"the ranks were started with different {BACKEND_ENV}: {', '.join(names)} (rank order)")
-+    return base if name == "nccl" else BACKENDS[name](base)
 diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
 index a38be70..6b29010 100644
 --- tensorfold/cuda/geometry.py
@@ -1009,10 +753,10 @@ index 0000000..3a836ab
 +        raise ValueError(f"rank {rank} of {world}: [{a}, {b}) of {total} is not whole on an axis of {length}")
 +    return a * length // total, b * length // total
 diff --git tensorfold/families/glm5_next/__init__.py tensorfold/families/glm5_next/__init__.py
-index 35b2463..7070f55 100644
+index 320cdae..b34fcf7 100644
 --- tensorfold/families/glm5_next/__init__.py
 +++ tensorfold/families/glm5_next/__init__.py
-@@ -200,17 +200,21 @@ def memory_fraction(ram_bytes: int) -> float | None:
+@@ -201,17 +201,21 @@ def memory_fraction(ram_bytes: int) -> float | None:
  
  # the CUDA engine's kernels read MLX affine weights of this (bits, group size); EXL3 checkpoints are checked above
  CUDA_QUANTIZATION = (4, 64)
@@ -1024,22 +768,22 @@ index 35b2463..7070f55 100644
 -    """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
 +    """Build the N-rank engine (N = 2, 3 or 4) with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
  
--    if int(tp) != 2:
+-    if int(tp) not in (2, 4):
 -        raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
--                         "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
+-                         "with --tp 2/4 --rank R --master ADDRESS on both (non-zero ranks first)")
 +    tp = int(tp)
 +    if tp not in CUDA_TP:
 +        raise ValueError("GLM-5.3-Flash needs two GPUs or more (2, 3 or 4), one per machine: run the same "
 +                         "`tensorfold serve` command with --tp N --rank R --master ADDRESS on each (rank 0 last)")
      if not master:
--        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+-        raise ValueError("--tp 2/4 needs --master: rank 0's address on the link between the ranks")
 +        raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
 +    if not 0 <= int(rank) < tp:
 +        raise ValueError(f"--rank {rank}: 0 to {tp - 1} with --tp {tp}")
      from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
  
      if mtp_drafts is None:
-@@ -219,7 +223,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+@@ -220,10 +224,10 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
          policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
      else:
          policy = str(int(mtp_drafts))
@@ -1047,7 +791,11 @@ index 35b2463..7070f55 100644
 +    return GlmEngine(Path(model_dir), rank=int(rank), world=tp, master=master, port=int(master_port), policy=policy,
                       drafter=Path(drafter) if drafter and not no_drafts else None,
                       context=options.get("context"), context_explicit=options.get("context_explicit"),
-                      serial_only=bool(no_drafts), vision=bool(options.get("vision", False)),
+-                     serial_only=bool(no_drafts), world=int(tp),
++                     serial_only=bool(no_drafts),
+                      vision=bool(options.get("vision", False)),
+                      vision_urls=bool(options.get("vision_urls", False)), parallel=int(options.get("parallel", 1)))
+ 
 diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
 index be872ae..d355e85 100644
 --- tensorfold/families/glm5_next/cuda/decode.py
@@ -1128,7 +876,7 @@ index b5dcd26..69d2268 100644
                      if tuple(get(p + conv + ".base_kernel").shape) != (2, 2, self.D):
                          raise ValueError(f"unexpected {conv} base kernel shape")
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 7e77d11..3bb612a 100644
+index 44f4a58..a8422e1 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -1,4 +1,4 @@
@@ -1235,8 +983,9 @@ index 7e77d11..3bb612a 100644
 +    def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, world: int = 2,
 +                 policy: str = DEFAULT_POLICY,
                   drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                  prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
+-                 prefill_rows: int | None = None, world: int = 2, vision: bool = False, vision_urls: bool = False,
 -                 split=None, parallel: int = 1) -> None:
++                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
 +                 split=None, parallel: int = 1, graphs: bool = True) -> None:
          """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
          ``vision``: rank 0 runs the image tower (rank 1 only takes its rows); ``split``: a ``hcsplit.SplitSettings``
@@ -1248,7 +997,7 @@ index 7e77d11..3bb612a 100644
  
          import torch
  
-@@ -414,26 +450,34 @@ class GlmEngine:
+@@ -414,28 +450,34 @@ class GlmEngine:
          # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
          # ranks (and its exchanges overlapped); the same bits, both ranks must agree (the comparison below)
          self.split = SplitSettings.from_env() if split is None else split
@@ -1267,7 +1016,9 @@ index 7e77d11..3bb612a 100644
          self.parallel = parallel
          self.policy = "0" if serial_only else policy
          self.serial_only = serial_only
--        self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
+-        world_ranks = getattr(comm, "world", world) if comm is not None else world
+-        self.comm = comm if comm is not None else open_comm(rank, world_ranks, master, port)
+-        self.world = world_ranks
 +        self.comm = comm if comm is not None else open_comm(rank, world, master, port)
          self.comm.barrier()
          if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
@@ -1289,11 +1040,12 @@ index 7e77d11..3bb612a 100644
          cfg = Config.read(model_dir)
          # Without --context the window stays dense, attending every key without indexer work.
          explicit = context is not None if context_explicit is None else bool(context_explicit)
-@@ -442,7 +486,28 @@ class GlmEngine:
-         from .qmm import KVB_KINDS, dense_kind, fp8_weights, kvb_kind, kvb_weights, q4_weights
+@@ -445,8 +487,29 @@ class GlmEngine:
  
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
+-        weights_estimate = split_weights(rule, self.world)
          # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
--        weights_estimate = split_weights(rule)
 +        from . import tp as tp_mod
 +        from .split import rank_cut
 +
@@ -1319,13 +1071,14 @@ index 7e77d11..3bb612a 100644
          if cfg.quant == "exl3" and dense_kind() == "fp8":
              weights_estimate = fp8_weights(weights_estimate)
          elif cfg.quant == "exl3" and dense_kind() == "q4":
-@@ -488,13 +553,13 @@ class GlmEngine:
+@@ -490,14 +553,14 @@ class GlmEngine:
          def geometry(text):
              from tensorfold.cuda.capacity import Geometry
  
--            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
-+            g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
-                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+-            g = mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT,
++            g = mla_geometry(text, self.world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prefill_rows, mtp=self.mtp_on, onepass=SPARSE_ONEPASS,
+                              exl3_prompt=prompt_kernels(),
                               prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
              # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
              # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
@@ -1335,12 +1088,12 @@ index 7e77d11..3bb612a 100644
              per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
              if not extra and not per:
                  return g
-@@ -503,16 +568,17 @@ class GlmEngine:
+@@ -506,16 +569,17 @@ class GlmEngine:
          def draft_geometry(text):
              from tensorfold.cuda.capacity import Geometry
  
--            g = dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING)
-+            g = dflash2_geometry(text, world, MAX_ROWS, ring=DRAFT_RING,
+-            g = dflash2_geometry(text, self.world, MAX_ROWS, ring=DRAFT_RING)
++            g = dflash2_geometry(text, self.world, MAX_ROWS, ring=DRAFT_RING,
 +                                 kv_heads=tp_mod.split_sizes(int(text["num_key_value_heads"]), world, 1)[rank])
              if parallel == 1:
                  return g
@@ -1350,14 +1103,13 @@ index 7e77d11..3bb612a 100644
                                                                                   capacity=slots), g.reserve)
          self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                     geometry,
--                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
--                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
-+                                   weights_estimate, rank=rank, world=world, gather=self._gather_ints,
-+                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, world, draft_fraction(d, rank, world)),
+                                    weights_estimate, rank=rank, world=self.world, gather=self._gather_ints,
+-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, self.world),
++                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, self.world, draft_fraction(d, rank, world)),
                                     draft_geometry=draft_geometry)
          self.limit = self.capacity_plan["context_window"]
          capacity = self.capacity_plan["cache_slots"]
-@@ -538,7 +604,7 @@ class GlmEngine:
+@@ -541,7 +605,7 @@ class GlmEngine:
              verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
          else:
              verify_code = [verify_code]
@@ -1366,7 +1118,7 @@ index 7e77d11..3bb612a 100644
          mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                  prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
              self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
-@@ -549,17 +615,19 @@ class GlmEngine:
+@@ -552,17 +616,19 @@ class GlmEngine:
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
          spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
@@ -1392,7 +1144,7 @@ index 7e77d11..3bb612a 100644
          plan["kept_bytes"] = self.cache_bytes
          for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
              plan[key] = plan[key] + self.cache_bytes
-@@ -575,7 +643,8 @@ class GlmEngine:
+@@ -578,7 +644,8 @@ class GlmEngine:
              text = read_config(model_dir)
              g = geometry(text)
              per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
@@ -1402,7 +1154,7 @@ index 7e77d11..3bb612a 100644
              pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
              if pool_rows < ALIGN:
                  raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
-@@ -590,15 +659,20 @@ class GlmEngine:
+@@ -593,15 +660,20 @@ class GlmEngine:
              raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
                               "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
                               "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
@@ -1424,12 +1176,12 @@ index 7e77d11..3bb612a 100644
 +                peers = [p for p in range(world) if p != rank]
 +                self.comm.exchange_all({p: [a] for p in peers}, {p: [torch.empty_like(a)] for p in peers})
              torch.cuda.synchronize()
--        w = load(model_dir, rank=rank, mtp=self.mtp_on)
-+        w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on)
+-        w = load(model_dir, rank=rank, mtp=self.mtp_on, world=self.world)
++        w = load(model_dir, rank=rank, world=self.world, mtp=self.mtp_on)
          w.comm = self.comm
          self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
          self.comm.barrier()
-@@ -612,7 +686,7 @@ class GlmEngine:
+@@ -615,7 +687,7 @@ class GlmEngine:
              from .dflash2 import Drafter
  
              self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
@@ -1438,7 +1190,7 @@ index 7e77d11..3bb612a 100644
                          graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                          taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
                          split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
-@@ -649,7 +723,8 @@ class GlmEngine:
+@@ -652,7 +724,8 @@ class GlmEngine:
              print(f"[tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end "
                    f"of its system block, when they add {self.shared}+ tokens (TF_GLM_SHARED_PREFIX)", flush=True)
          if self.drafter is not None:
@@ -1448,27 +1200,9 @@ index 7e77d11..3bb612a 100644
          self.costs = self._calibrate()
          if rank == 0:
              c = self.costs
-@@ -759,9 +834,9 @@ class GlmEngine:
-                 back()
-         names = list(best)
-         mine = torch.tensor([best[n] for n in names], dtype=torch.float32, device="cuda")
--        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device="cuda")
-+        got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device="cuda")
+@@ -789,7 +862,8 @@ class GlmEngine:
          self.comm.all_gather(mine, got)
--        both = dict(zip(names, got.view(2, -1).max(dim=0).values.tolist()))
-+        both = dict(zip(names, got.view(self.world, -1).max(dim=0).values.tolist()))
-         e.reset()
-         if self.drafter is not None:
-             self.drafter.reset()
-@@ -779,11 +854,12 @@ class GlmEngine:
-     def _gather_ints(self, values: list[int]) -> list[list[int]]:
-         torch = self.torch
-         mine = torch.tensor(values, dtype=torch.int32, device="cuda")
--        got = torch.empty((2 * len(values),), dtype=torch.int32, device="cuda")
-+        got = torch.empty((self.world * len(values),), dtype=torch.int32, device="cuda")
-         self.comm.all_gather(mine, got)
--        return [got[:len(values)].tolist(), got[len(values):].tolist()]
-+        return got.view(self.world, len(values)).tolist()
+         return [got[i * len(values):(i + 1) * len(values)].tolist() for i in range(world)]
  
 -    # the idle doorbell: rank 1 waits for each request on the rendezvous store (no store: no doorbell), not in NCCL
 +    # the idle doorbell: the followers wait for each request on the rendezvous store (no store: no doorbell), not in
@@ -1476,7 +1210,7 @@ index 7e77d11..3bb612a 100644
      def _store(self):
          return getattr(self.comm, "store", None)
  
-@@ -791,7 +867,8 @@ class GlmEngine:
+@@ -797,7 +871,8 @@ class GlmEngine:
          store = self._store()
          if store is not None:
              self._bell = getattr(self, "_bell", 0) + 1
@@ -1486,7 +1220,7 @@ index 7e77d11..3bb612a 100644
  
      def _await_bell(self) -> None:
          store = self._store()
-@@ -799,7 +876,7 @@ class GlmEngine:
+@@ -805,7 +880,7 @@ class GlmEngine:
              return
          from datetime import timedelta
  
@@ -1495,23 +1229,8 @@ index 7e77d11..3bb612a 100644
          while True:
              try:
                  store.wait([key], timedelta(hours=1))
-@@ -815,12 +892,12 @@ class GlmEngine:
- 
-         torch = self.torch
-         n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
--        got = torch.empty((2,), dtype=torch.int32, device="cuda")
-+        got = torch.empty((self.world,), dtype=torch.int32, device="cuda")
-         self.comm.all_gather(n, got)
-         count = int(got[0].item())
-         buf = (torch.tensor(values, dtype=torch.int32, device="cuda") if self.rank == 0
-                else torch.zeros((count,), dtype=torch.int32, device="cuda"))
--        allv = torch.empty((2 * count,), dtype=torch.int32, device="cuda")
-+        allv = torch.empty((self.world * count,), dtype=torch.int32, device="cuda")
-         self.comm.all_gather(buf, allv)
-         return [int(v) for v in allv[:count].tolist()]
- 
-@@ -1161,7 +1238,7 @@ class GlmEngine:
-         return [[float(item) for item in got[:width].tolist()], [float(item) for item in got[width:].tolist()]]
+@@ -1169,7 +1244,7 @@ class GlmEngine:
+         return [[float(item) for item in got[i * width:(i + 1) * width].tolist()] for i in range(world)]
  
      def follow(self) -> None:
 -        """Rank 1: mirror every request rank 0 serves, forever."""
@@ -1519,7 +1238,7 @@ index 7e77d11..3bb612a 100644
  
          if self.multi is not None:
              self.multi.follow()
-@@ -1170,7 +1247,7 @@ class GlmEngine:
+@@ -1178,7 +1253,7 @@ class GlmEngine:
              self.follow_one()
  
      def follow_one(self) -> None:
@@ -1528,7 +1247,7 @@ index 7e77d11..3bb612a 100644
  
          from tensorfold.engine.exact_sampling import Sampling
  
-@@ -1202,7 +1279,7 @@ class GlmEngine:
+@@ -1210,7 +1285,7 @@ class GlmEngine:
              if cached:
                  hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
                  if hit is None:
@@ -1537,7 +1256,7 @@ index 7e77d11..3bb612a 100644
              self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
                        constraint, feed, shared)
              if hasattr(self.comm, "check"):
-@@ -1211,7 +1288,7 @@ class GlmEngine:
+@@ -1219,7 +1294,7 @@ class GlmEngine:
  
  class VisionFeed:
      """An image prompt's feature rows for each prefill chunk: rank 0 holds them all, and hands a chunk's rows to
@@ -1546,7 +1265,7 @@ index 7e77d11..3bb612a 100644
  
      def __init__(self, engine: GlmEngine, positions: list[int], rows) -> None:
          self.engine, self.positions, self.rows = engine, positions, rows
-@@ -1231,7 +1308,7 @@ class VisionFeed:
+@@ -1239,7 +1314,7 @@ class VisionFeed:
          n = hi - lo
          mine = (self.rows[lo:hi].contiguous() if self.rows is not None else
                  torch.zeros((n, self.width), dtype=torch.bfloat16, device="cuda"))
@@ -2082,15 +1801,15 @@ index 4c7f64e..bfc06e2 100644
              _unwatch(self.watchdog)
              if once:
 diff --git tensorfold/families/glm5_next/cuda/split.py tensorfold/families/glm5_next/cuda/split.py
-index 8f51c55..a973b31 100644
+index 38220fa..a973b31 100644
 --- tensorfold/families/glm5_next/cuda/split.py
 +++ tensorfold/families/glm5_next/cuda/split.py
 @@ -71,54 +71,84 @@ def read_header(path: str | Path) -> tuple[dict, int]:
      return header, 8 + n
  
  
--def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int) -> tuple[np.ndarray, list[int]]:
--    """A tensor's bytes -> rank's part of them and its shape."""
+-def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int, ranks: int = 2) -> tuple[np.ndarray, list[int]]:
+-    """A tensor's bytes -> rank's part of them and its shape (ranks: 2 or 4)."""
 +AXIS = {"row": 0, "col": 1, "dim1": 1}
 +
 +
@@ -2124,30 +1843,31 @@ index 8f51c55..a973b31 100644
 +    a, b = _cut(shape, kind, rank, cut)
      if kind == "row":
 -        rows = shape[0]
--        if rows % 2:
--            raise ValueError(f"row split of odd leading dim {shape}")
+-        if rows % ranks:
+-            raise ValueError(f"row split of leading dim {shape} not divisible by {ranks}")
 -        per = raw.size // rows
--        half = rows // 2
--        return raw[rank * half * per:(rank + 1) * half * per], [half] + list(shape[1:])
+-        chunk = rows // ranks
+-        return raw[rank * chunk * per:(rank + 1) * chunk * per], [chunk] + list(shape[1:])
 -    if kind == "col":
--        if len(shape) != 2 or shape[1] % 2:
--            raise ValueError(f"column split needs an even 2-D shape, got {shape}")
+-        if len(shape) != 2 or shape[1] % ranks:
+-            raise ValueError(f"column split needs a 2-D shape divisible by {ranks}, got {shape}")
 -        view = raw.reshape(shape[0], shape[1] * itemsize)
--        half = shape[1] // 2
--        part = np.ascontiguousarray(view[:, rank * half * itemsize:(rank + 1) * half * itemsize])
--        return part.reshape(-1), [shape[0], half]
+-        chunk = shape[1] // ranks
+-        part = np.ascontiguousarray(view[:, rank * chunk * itemsize:(rank + 1) * chunk * itemsize])
+-        return part.reshape(-1), [shape[0], chunk]
 -    if kind == "dim1":                                   # the second axis of a 2-D or higher tensor
--        if len(shape) < 2 or shape[1] % 2:
--            raise ValueError(f"split of the second axis needs an even second dim, got {shape}")
+-        if len(shape) < 2 or shape[1] % ranks:
+-            raise ValueError(f"split of the second axis needs a second dim divisible by {ranks}, got {shape}")
 -        inner = int(np.prod(shape[2:])) * itemsize
 -        view = raw.reshape(shape[0], shape[1] * inner)
--        half = shape[1] // 2
--        part = np.ascontiguousarray(view[:, rank * half * inner:(rank + 1) * half * inner])
--        return part.reshape(-1), [shape[0], half] + list(shape[2:])
+-        chunk = shape[1] // ranks
+-        part = np.ascontiguousarray(view[:, rank * chunk * inner:(rank + 1) * chunk * inner])
+-        return part.reshape(-1), [shape[0], chunk] + list(shape[2:])
 -    raise ValueError(kind)
 -
 -
--def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int):
+-def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, ranks: int = 2):
+-    """split_bytes for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
 +        per = raw.size // shape[0]
 +        return raw[a * per:b * per], [b - a] + list(shape[1:])
 +    inner = int(np.prod(shape[2:])) * itemsize
@@ -2157,7 +1877,7 @@ index 8f51c55..a973b31 100644
 +
 +
 +def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, cut: tuple[int, int] | None = None):
-     """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
++    """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
  
      if kind == "rep":
          return raw.clone(), list(shape)
@@ -2165,17 +1885,17 @@ index 8f51c55..a973b31 100644
 +        raise ValueError(kind)
 +    a, b = _cut(shape, kind, rank, cut)
      if kind == "row":
--        if shape[0] % 2:
--            raise ValueError(f"row split of odd leading dim {shape}")
--        per, half = raw.numel() // shape[0], shape[0] // 2
--        return raw[rank * half * per:(rank + 1) * half * per].clone(), [half] + list(shape[1:])
+-        if shape[0] % ranks:
+-            raise ValueError(f"row split of leading dim {shape} not divisible by {ranks}")
+-        per, chunk = raw.numel() // shape[0], shape[0] // ranks
+-        return raw[rank * chunk * per:(rank + 1) * chunk * per].clone(), [chunk] + list(shape[1:])
 -    if kind in ("col", "dim1"):
--        if len(shape) < 2 or shape[1] % 2 or (kind == "col" and len(shape) != 2):
--            raise ValueError(f"{kind} split needs an even second dim, got {shape}")
+-        if len(shape) < 2 or shape[1] % ranks or (kind == "col" and len(shape) != 2):
+-            raise ValueError(f"{kind} split needs a second dim divisible by {ranks}, got {shape}")
 -        inner = int(np.prod(shape[2:])) * itemsize
--        half = shape[1] // 2
--        part = raw.view(shape[0], shape[1] * inner)[:, rank * half * inner:(rank + 1) * half * inner]
--        return part.contiguous().reshape(-1), [shape[0], half] + list(shape[2:])
+-        chunk = shape[1] // ranks
+-        part = raw.view(shape[0], shape[1] * inner)[:, rank * chunk * inner:(rank + 1) * chunk * inner]
+-        return part.contiguous().reshape(-1), [shape[0], chunk] + list(shape[2:])
 -    raise ValueError(kind)
 +        per = raw.numel() // shape[0]
 +        return raw[a * per:b * per].clone(), [b - a] + list(shape[1:])
@@ -2228,11 +1948,11 @@ index 8f51c55..a973b31 100644
  class RankReader:
      """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
  
--    def __init__(self, model_dir: str | Path, rank: int) -> None:
+-    def __init__(self, model_dir: str | Path, rank: int, ranks: int = 2) -> None:
 +    def __init__(self, model_dir: str | Path, rank: int, world: int = 2) -> None:
          from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
  
--        self.dir, self.rank = Path(model_dir), rank
+-        self.dir, self.rank, self.ranks = Path(model_dir), rank, ranks
 -        self.io = Reader()                                # O_DIRECT reads where the file system allows them
 -        self.reads = ReadAhead(self.io, READERS, RUN, GAP)
 -        mine, other = rank_files(self.dir, rank), rank_files(self.dir, 1 - rank)
@@ -2288,13 +2008,14 @@ index 8f51c55..a973b31 100644
          file = str(self.dir / self.index[name])
          if file not in self.files:
              self.files[file] = read_header(file)
-@@ -196,18 +256,22 @@ class RankReader:
+@@ -196,19 +256,22 @@ class RankReader:
              raise KeyError(f"{name} is not used by the engine")
          a, b = info["data_offsets"]
          shape = list(info["shape"])
--        if kind == "row" and shape and shape[0] % 2 == 0:   # the rank's rows are one run: read only those
--            per = (b - a) // shape[0] * (shape[0] // 2)
--            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // 2] + shape[1:]
+-        if kind == "row" and shape and shape[0] % self.ranks == 0:   # the rank's rows are one run: read only those
+-            chunk = shape[0] // self.ranks
+-            per = (b - a) // shape[0] * chunk
+-            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [chunk] + shape[1:]
 -        return file, base + a, base + b, kind, shape, info["dtype"]
 +        cut = rank_cut(self.layout, name, shape, kind)
 +        if kind == "row" and cut is None and shape and shape[0] % 2 == 0:
@@ -2311,28 +2032,28 @@ index 8f51c55..a973b31 100644
          import torch
  
 -        _, _, _, kind, shape, dtype = span
--        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+-        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, self.ranks)
 +        _, _, _, kind, shape, dtype, cut = span
 +        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, cut)
          if own and np.may_share_memory(data, raw):
              data = data.copy()
          return torch.from_numpy(data).view(torch_dtype(dtype)).reshape(shape)
-@@ -223,8 +287,8 @@ class RankReader:
+@@ -224,8 +287,8 @@ class RankReader:
  
          if not raw.is_cuda:
              return self._tensor(raw.numpy(), span, own=True)
 -        _, _, _, kind, shape, dtype = span
--        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+-        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, self.ranks)
 +        _, _, _, kind, shape, dtype, cut = span
 +        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, cut)
          return data.view(torch_dtype(dtype)).reshape(shape)
  
  def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], metadata: dict | None) -> None:
-@@ -246,11 +310,16 @@ def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], meta
+@@ -247,11 +310,16 @@ def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], meta
      os.replace(tmp, path)
  
  
--def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+-def split_file(src: str | Path, out: str | Path, rank: int, ranks: int = 2) -> dict:
 -    """One checkpoint file -> OUT/<stem>.rank<R>.safetensors with the rank's part of every tensor it keeps."""
 +def split_file(src: str | Path, out: str | Path, rank: int, world: int = 2, layout=None) -> dict:
 +    """One checkpoint file -> OUT/<stem>.rank<R>.safetensors with the rank's part of every tensor it keeps (of
@@ -2347,24 +2068,24 @@ index 8f51c55..a973b31 100644
      mm = np.memmap(src, dtype=np.uint8, mode="r")
      stem = os.path.basename(str(src)).replace(".safetensors", "")
      summary = {"rep": 0, "row": 0, "col": 0, "dim1": 0, "drop": 0}
-@@ -263,7 +332,8 @@ def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+@@ -264,7 +332,8 @@ def split_file(src: str | Path, out: str | Path, rank: int, ranks: int = 2) -> d
              continue
          a, b = info["data_offsets"]
          itemsize = DTYPE_BYTES[info["dtype"]]
--        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank)
+-        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank, ranks)
 +        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank,
 +                                  rank_cut(layout, name, list(info["shape"]), kind))
          if int(np.prod(shape)) * itemsize != data.size:
              raise ValueError(f"{name}: {shape} does not match {data.size} bytes")
          part.append((name, info["dtype"], shape, data))
-@@ -276,9 +346,13 @@ def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+@@ -277,10 +346,13 @@ def split_file(src: str | Path, out: str | Path, rank: int, ranks: int = 2) -> d
  def main(argv: list[str] | None = None) -> int:
      p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
      p.add_argument("model_dir", type=Path, help="the checkpoint (e.g. the snapshot `tensorfold pull` downloaded)")
--    p.add_argument("--rank", type=int, choices=(0, 1), required=True, help="the rank this machine serves")
--    p.add_argument("out", type=Path, help="the folder to write (then: tensorfold serve OUT --tp 2 --rank R ...)")
 +    p.add_argument("--tp", type=int, choices=(2, 3, 4), default=2, help="ranks the model is split over")
-+    p.add_argument("--rank", type=int, choices=(0, 1, 2, 3), required=True, help="the rank this machine serves")
+     p.add_argument("--rank", type=int, choices=(0, 1, 2, 3), required=True, help="the rank this machine serves")
+-    p.add_argument("--ranks", type=int, choices=(2, 4), default=2, help="total ranks the weights split over")
+-    p.add_argument("out", type=Path, help="the folder to write (then: tensorfold serve OUT --tp 2 --rank R ...)")
 +    p.add_argument("out", type=Path, help="the folder to write (then: tensorfold serve OUT --tp N --rank R ...)")
      args = p.parse_args(argv)
 +    if args.rank >= args.tp:
@@ -2373,11 +2094,11 @@ index 8f51c55..a973b31 100644
      files = sorted(args.model_dir.glob("model-*.safetensors"))
      if not files:
          raise SystemExit(f"{args.model_dir}: no model-*.safetensors files")
-@@ -290,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
+@@ -292,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
          stem = src.name.replace(".safetensors", "")
          if (args.out / f"{stem}.rank{args.rank}.safetensors").exists():
              continue
--        print(src.name, split_file(src, args.out, args.rank), flush=True)
+-        print(src.name, split_file(src, args.out, args.rank, args.ranks), flush=True)
 +        print(src.name, split_file(src, args.out, args.rank, args.tp, layout), flush=True)
      print(f"rank {args.rank}'s share of {len(files)} files in {args.out}", flush=True)
      return 0
@@ -2582,7 +2303,7 @@ index f359bc9..64dbc7c 100644
          self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
          self.dsa_index = {l.index: i for i, l in enumerate(l for l in w.layers if l.kind == "dsa")}
 diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
-index e841e8f..339bcf3 100644
+index b9e0220..339bcf3 100644
 --- tensorfold/families/glm5_next/cuda/weights.py
 +++ tensorfold/families/glm5_next/cuda/weights.py
 @@ -223,10 +223,17 @@ class Weights:
@@ -2604,12 +2325,12 @@ index e841e8f..339bcf3 100644
  
      def nbytes(self) -> int:
          total = 0
-@@ -257,20 +264,22 @@ class Weights:
+@@ -257,19 +264,22 @@ class Weights:
          return total
  
  
--def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
--    """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
+-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True, world: int = 2) -> Weights:
+-    """One of world ranks from a checkpoint or rank folder, MTP included unless mtp is False."""
 +def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True) -> Weights:
 +    """Rank ``rank`` of ``world`` from a checkpoint or rank folder (``tp.Layout``'s shares), MTP included unless
 +    ``mtp`` is False, with its rows of the head."""
@@ -2617,14 +2338,13 @@ index e841e8f..339bcf3 100644
      from .split import RankReader
 +    from .tp import Layout
  
--    world = 2
      cfg = Config.read(model_dir)
 +    lay = Layout.from_config(cfg, rank, world)
      if cfg.quant not in ("mlx", "exl3"):
          raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
      exl3 = cfg.quant == "exl3"
      dev = torch.device(device)
--    rd = RankReader(model_dir, rank)
+-    rd = RankReader(model_dir, rank, ranks=world)
 -    HL = cfg.heads // world
 -    LL = cfg.lin_heads // world
 +    rd = RankReader(model_dir, rank, world)
@@ -2633,7 +2353,7 @@ index e841e8f..339bcf3 100644
  
      def t(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
          x = rd.get(PREFIX + name)
-@@ -443,23 +452,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+@@ -442,23 +452,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
      try:                                          # a failed load still cancels the reads queued ahead
          which = list(range(cfg.layers))
          built = [layer(i) for i in which]

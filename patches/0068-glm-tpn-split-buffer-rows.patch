@@ -19,10 +19,10 @@ index 1e6d712..40aa44e 100644
          if taps:
              self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 83956bd..ef03702 100644
+index 1c5838e..260533e 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -548,12 +548,18 @@ class GlmEngine:
+@@ -548,14 +548,19 @@ class GlmEngine:
                                                     if name.startswith("model.visual.") else text_weights(name, info))
  
          from .exl3_mm import prompt_kernels
@@ -36,12 +36,14 @@ index 83956bd..ef03702 100644
          def geometry(text):
              from tensorfold.cuda.capacity import Geometry
  
--            g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
-+            g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+             g = mla_geometry(text, self.world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+-                             prefill_rows=prefill_rows, mtp=self.mtp_on, onepass=SPARSE_ONEPASS,
+-                             exl3_prompt=prompt_kernels(),
 +                             prefill_rows=prompt_buffer_rows,
-                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
++                             mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
                               prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
              # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
+             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
 diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
 index 3c14726..79b4f8c 100644
 --- tensorfold/families/glm5_next/cuda/hcsplit.py

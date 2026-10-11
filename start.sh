@@ -19,17 +19,19 @@
 # Setup: WORKER=user@<worker address> in scripts/local.sh (key-based ssh).
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, DRAFT_POLICY, COPY, COPY_MAX, COPY_CODE, SPLIT, KDA_CHUNKED,
-#            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, KV_POOL_GIB,
-#            MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST, PORT
+#            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, FILL_ROWS,
+#            KV_POOL_GIB, MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST, PORT
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
 #            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks)
-#   files    MODEL_ID, MODEL_REVISION, DFLASH2_ID, DFLASH2_REVISION, HF_CACHE (default: HF_HOME), KERNEL_CACHE,
+#   files    ABLIT (1: the gated Ablit weights, needs HF_TOKEN), MODEL_ID, MODEL_REVISION, DFLASH2_ID, DFLASH2_REVISION,
+#            HF_CACHE (default: HF_HOME), KERNEL_CACHE,
 #            WORKER_WEIGHTS (copy | nfs: rank 1 reads the head's HF_CACHE over NFS), NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_WEIGHTS2, NFS_SERVER2,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
-#   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads);
+#   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
+#            required with ABLIT=1);
 #            FOREGROUND=1 (stay attached to rank 0's log, exit with its code); WAIT_TIMEOUT (seconds, default 1800);
 #            DRY_RUN=1 (print the docker commands, change nothing);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
@@ -51,6 +53,7 @@ case "${1:-}" in
   help) usage; exit 0 ;;
 esac
 for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }; done
+need_hf_token                        # ABLIT=1 (gated weights) without HF_TOKEN: say so before anything else
 
 # The serve arguments both ranks share: scripts/config.sh's defaults first, then the command line's (argparse keeps
 # the last value). --drafter goes in front after the setup step, which knows DFlash2's snapshot.
@@ -65,6 +68,24 @@ check_workers
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
 [[ "$DRAFTER" == dflash2 || "$PARALLEL" == 1 ]] || die "PARALLEL=$PARALLEL needs DRAFTER=dflash2 (mtp serves one request at a time: PARALLEL=1)"
 for v in SPLIT SHARED_PREFIX KDA_CHUNKED COPY_CODE MULTI_PREFILL STREAM_SMOOTH; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ "$DISPLAY_KV_MIB" =~ ^(0|[1-9][0-9]{0,3})$ ]] && (( DISPLAY_KV_MIB % 16 == 0 && DISPLAY_KV_MIB <= 2032 )) ||
+  die "DISPLAY_KV_MIB is a multiple of 16 from 0 to 2032, not $DISPLAY_KV_MIB"
+(( DISPLAY_KV_MIB == 0 || PARALLEL > 1 )) || die "DISPLAY_KV_MIB adds to the shared pool, which needs PARALLEL above 1"
+[[ "$DISPLAY_KV_BACKEND" == drm || "$DISPLAY_KV_BACKEND" == dispram ]] ||
+  die "DISPLAY_KV_BACKEND is drm or dispram, not $DISPLAY_KV_BACKEND"
+if (( DISPLAY_KV_MIB )) && [[ "$DISPLAY_KV_BACKEND" == dispram ]]; then
+  # kindling spark-os: dispramd owns the reservation (its nvidia_drm has no dumb buffers); every rank gets its socket
+  # and python client (RUN_ARGS below), and the rank fails closed without them
+  [[ -S /run/dispram/dispram.sock ]] || die "DISPLAY_KV_BACKEND=dispram needs dispramd (/run/dispram/dispram.sock), which this Spark lacks"
+  [[ -d /opt/kindling/dispram/python ]] || die "DISPLAY_KV_BACKEND=dispram needs the dispram client (/opt/kindling/dispram/python)"
+elif (( DISPLAY_KV_MIB )); then        # headless only: a monitor's framebuffer lives in the reservation
+  [[ -e /dev/dri/card0 ]] || die "DISPLAY_KV_MIB needs /dev/dri/card0, which this Spark lacks"
+  # no outputs under card0 at all: nvidia_drm runs without modeset, which has no dumb buffers for the span
+  compgen -G '/sys/class/drm/card0-*/status' >/dev/null ||
+    die "DISPLAY_KV_MIB needs nvidia_drm with modeset=1, and card0 shows no display outputs (an /etc/modprobe.d file may set modeset=0); set it to 0"
+  _shown=$(grep -lx connected /sys/class/drm/card0-*/status 2>/dev/null | sed 's|.*/\(card0-[^/]*\)/status|\1|' | paste -sd, - || true)
+  [[ -z "$_shown" ]] || die "DISPLAY_KV_MIB is for headless Sparks, and $_shown has a display connected; set it to 0"
+fi
 [[ "$WORKER_WEIGHTS" == copy || "$WORKER_WEIGHTS" == nfs ]] || die "WORKER_WEIGHTS is copy or nfs, not $WORKER_WEIGHTS"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$KV_POOL_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "KV_POOL_GIB is a number of GiB, not $KV_POOL_GIB"
@@ -75,12 +96,19 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$TF_GLM_MULTI_LONE" =~ ^[01]$ ]] || die "TF_GLM_MULTI_LONE is 0 or 1, not $TF_GLM_MULTI_LONE"
 [[ "$TF_GLM_MULTI_WINDOW" =~ ^(16|24|32|40|48|56|64)$ ]] || die "TF_GLM_MULTI_WINDOW is 16 to 64 rows in steps of 8, not $TF_GLM_MULTI_WINDOW"
 [[ "$TF_GLM_CLEAR_THINKING" =~ ^[01]$ ]] || die "TF_GLM_CLEAR_THINKING is 0 or 1, not $TF_GLM_CLEAR_THINKING"
+[[ "$TF_GLM_EFFORT_TAIL" =~ ^[01]$ ]] || die "TF_GLM_EFFORT_TAIL is 0 or 1, not $TF_GLM_EFFORT_TAIL"
 [[ "$TF_GLM_L2PF" =~ ^(0|off|1|bulk|lines|touch)$ ]] || die "TF_GLM_L2PF is 0, 1 (bulk), lines or touch, not $TF_GLM_L2PF"
 [[ "$TF_GLM_EXL3_LOADS" =~ ^(0|ldg|1|nc|nc1|nc2|nc4)$ ]] || die "TF_GLM_EXL3_LOADS is 0, nc, nc2 or nc4, not $TF_GLM_EXL3_LOADS"
+[[ "$TF_GLM_EXL3_DEC_ORDER" =~ ^[012]$ ]] || die "TF_GLM_EXL3_DEC_ORDER is 0, 1 or 2, not $TF_GLM_EXL3_DEC_ORDER"
 [[ "$TF_ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "TF_ROCE_MAX_KB is a size in KiB (512: up to 32-row windows over RoCE), not $TF_ROCE_MAX_KB"
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+if [[ "$SPILL_GIB" != 0 ]]; then                   # patch 0088: the spill tier (scripts/config.sh)
+  [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
+  SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
+               --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
+fi
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
 arg_value() {
@@ -202,7 +230,7 @@ docker run --rm --entrypoint python "$IMAGE" -c \
   if (( DRY )); then warn "DRY_RUN: tensorfold serve in $IMAGE rejects these arguments: $(tail -1 "$STATE_DIR/args.err")"
   else cat "$STATE_DIR/args.err" >&2; die "tensorfold serve rejects these arguments (see above); nothing was changed"; fi
 detect_links
-if (( TP == 2 )); then log "Link: $HEAD_ADDR ($HEAD_DEV) <-> $WORKER_ADDR ($WORKER_DEV), RoCE $HEAD_HCAS / $WORKER_HCAS"
+if (( TP == 2 )); then log "Link: $HEAD_ADDR ($HEAD_DEV) <-> $WORKER_ADDR ($WORKER_DEV), RoCE $HEAD_HCAS / $WORKER_HCAS (GID $HEAD_GID / $WORKER_GID; $(tr ',' '\n' <<<"$HEAD_HCAS" | wc -l) rail(s) -> NCCL_IB_HCA, TF_ROCE_HCA)"
 else
   log "Rendezvous: $MASTER_ADDR:$MASTER_PORT; NCCL bootstrap over ${NODE_DEV[*]} (rank 0 to $((TP - 1)))"
   for r in 0 $(worker_ids); do
@@ -278,11 +306,26 @@ fi
 # docker commands run over ssh, where this shell's environment does not reach. None of them is a secret. At TP>2,
 # TF_ROCE_HCA names a node's own devices, so each rank gets its own (scripts/nodes.sh, rank_nccl_env); at TP=2 it
 # passes as set, as in v1.4 (unset: the ranks take NCCL_IB_HCA's devices).
-ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
-_skip='^$'; (( TP == 2 )) || _skip='^TF_ROCE_HCA='
-while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
+env_args() {
+  local _skip='^$' name
+  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
+  (( TP == 2 )) || _skip='^TF_ROCE_HCA='
+  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
+}
+env_args
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
           --ulimit memlock=-1 --ulimit stack=67108864)
+# DISPLAY_KV_BACKEND=dispram (patch 0087): dispramd's socket and its python client in every rank
+if (( DISPLAY_KV_MIB )) && [[ "$DISPLAY_KV_BACKEND" == dispram ]]; then
+  RUN_ARGS+=(-v /run/dispram:/run/dispram -v /opt/kindling/dispram/python:/opt/dispram:ro -e PYTHONPATH=/opt/dispram)
+fi
+if [[ "$SPILL_GIB" != 0 ]]; then                   # the spill tier's directory on every rank, files owned by you
+  mkdir -p "$SPILL_DIR"
+  for i in $(worker_ids); do worker "$i" "mkdir -p '$SPILL_DIR'" || die "could not create SPILL_DIR on worker $i"; done
+  # (files take the owner of SPILL_DIR on each Spark. No --init on these containers: a rank past 0 runs as PID 1
+  # without a SIGTERM handler, so a stop leaves it serving rank 0's flush before both exit)
+  RUN_ARGS+=(-v "$SPILL_DIR":/spill -e TF_SPILL_FLUSH_S="$SPILL_FLUSH_S")
+fi
 
 # ---------------------------------------------------------------- 3. launch, 4. load (a second try when the window does not fit)
 # No token goes into the containers: the ranks read only the local cache (HF_HUB_OFFLINE=1), and with HF_HUB_OFFLINE=0
@@ -293,7 +336,7 @@ launch() {
   local rank0 rankw worker_cmd remote a i
   local -a here_cmd
   for (( i = TP - 1; i >= 1; i-- )); do
-    rankw=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank "$i" --master "$MASTER_ADDR" --master-port "$MASTER_PORT" "${SERVE_ARGS[@]}")
+    rankw=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank "$i" --master "${LINK_HEAD_ADDR[i]:-$MASTER_ADDR}" --master-port "$MASTER_PORT" "${SERVE_ARGS[@]}")
     log "Rank $i on $(worker_host "$i"): ${rankw[*]}"
     worker_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
                 $(rank_nccl_env "$i")
@@ -369,7 +412,19 @@ fail() {
   done
   die "$1"
 }
-for attempt in 1 2; do
+# Issue #36: on some pairs a rank's first NCCL connection fails with SPLIT=1, seconds into the start and before any
+# weights load (NCCL error 2, ibv_reg_mr: Cannot allocate memory), about half the time; a start that comes up stays up.
+# Such a start is tried once more as it was, then with SPLIT=0 (prompt chunks unsplit: the same replies, long prompts
+# fill slower), and says so.
+split_nccl_failed() {
+  local i
+  [[ "$SPLIT" == 1 ]] || return 1
+  { docker logs "$CONTAINER_NAME" 2>&1 || true
+    for i in $(worker_ids); do worker "$i" docker logs "$CONTAINER_NAME" 2>&1 || true; done
+  } | grep 'NCCL error 2: unhandled system error' >/dev/null      # not -q: an early exit fails the pipe (pipefail)
+}
+split_tries=0; refitted=0
+for attempt in 1 2 3 4; do
   if (( TP == 2 )); then step 3 "Launch: container $CONTAINER_NAME, rank 1 on $WORKER, then rank 0 here"
   else step 3 "Launch: container $CONTAINER_NAME, ranks $((TP - 1)) to 1 on the workers, then rank 0 here"; fi
   launch
@@ -381,20 +436,23 @@ for attempt in 1 2; do
   # docker logs is the background job, so killing it ends the whole pipeline (no orphaned `docker logs -f`)
   docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -u "s/^/  ${D}│${R} /") 2>&1 &
   LOGS_PID=$!
-  start=$SECONDS; next_beat=15; refit=""
+  start=$SECONDS; next_beat=15; refit=""; retry=""
   until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
     if ! running_here; then
       # the memory at this start holds a smaller window than asked: once, take the largest one TensorFold names
       refit=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*largest fitting prompt-plus-reply window: \([0-9]*\) tokens.*/\1/p' | tail -1)
-      [[ -n "$refit" && $attempt == 1 ]] && break
+      [[ -n "$refit" && $refitted == 0 ]] && break
+      refit=""
+      (( split_tries < 2 )) && split_nccl_failed && { retry=split; break; }
       fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
     fi
     (( SECONDS - start < WAIT_TIMEOUT )) ||
       fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running: docker logs -f $CONTAINER_NAME"
     if (( SECONDS - start >= next_beat )); then
       for i in $(worker_ids); do
-        running_worker "$i" ||
-          fail "rank $i on $(worker_host "$i") exited (code $(worker "$i" docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo "?")) before the server was ready"
+        running_worker "$i" && continue
+        (( split_tries < 2 )) && split_nccl_failed && { retry=split; break 2; }
+        fail "rank $i on $(worker_host "$i") exited (code $(worker "$i" docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo "?")) before the server was ready"
       done
       estimate=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*startup estimate \([0-9.]*\) GiB.*/\1/p' | tail -1)
       there=""
@@ -410,7 +468,21 @@ for attempt in 1 2; do
   done
   kill $LOGS_PID 2>/dev/null || true
   sleep 0.3
+  if [[ "$retry" == split ]]; then
+    split_tries=$((split_tries + 1))
+    if (( split_tries == 1 )); then
+      warn "a rank's first NCCL connection failed with SPLIT=1 (NCCL error 2, issue #36): starting again as it was"
+    else
+      warn "it failed again: starting with SPLIT=0 (prompt chunks unsplit: the same replies, long prompts fill slower); SPLIT=0 in .env skips these tries (issue #36)"
+      SPLIT=0
+      export TF_GLM_HC_SPLIT=0 TF_GLM_PREFILL_OVERLAP=0
+      env_args
+    fi
+    ./stop.sh >/dev/null
+    continue
+  fi
   [[ -z "$refit" ]] && break
+  refitted=1
   warn "this start's memory budget holds a ${refit}-token window, not $(arg_value --context): starting again with --context $refit"
   CONTEXT=$refit
   SERVE_ARGS+=(--context "$refit")
@@ -419,15 +491,15 @@ done
 log "Server answered after $((SECONDS - start))s"
 
 # ---------------------------------------------------------------- 5. smoke test
-# Thinking off and greedy, so that a short reply has text (the model thinks first otherwise); no text fails the start.
+# Thinking off and greedy, so that a short reply has text (the model thinks first otherwise); no text, or one character repeated (a collapsed model: issues #76, #81, #86), fails the start.
 step 5 "Smoke test: one chat completion through $( (( TP == 2 )) && echo "both" || echo "all $TP") ranks"
 SERVED=$(served_name || echo "$SERVED_NAME")
 if smoke=$(curl -s --max-time 180 "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED\", \"max_tokens\": 32, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
-           python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens,", r.get("tensorfold", {}).get("decode_s"), "s")' 2>/dev/null); then
+           python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens,", r.get("tensorfold", {}).get("decode_s"), "s")' 2>/dev/null); then
   log "OK: $smoke"
 else
-  fail "the smoke test request failed (no reply text); the ranks are still running"
+  fail "the smoke test request failed (no reply text, or one character repeated: the weights load but the model does not answer; see the README's Ablit weights); the ranks are still running"
 fi
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')

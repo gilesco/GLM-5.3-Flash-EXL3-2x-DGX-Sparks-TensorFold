@@ -8,3 +8,5 @@ TF_VERSION=v0.6.4
 # WORKER2=user@192.0.2.3       # rank 2
 # WORKER_WEIGHTS2=nfs          # per worker: copy or nfs (default: WORKER_WEIGHTS)
 # WORKER_HF_CACHE2=/models/hf   # per worker: its Hugging Face cache when it is not its HF_HOME
+# ABLIT=1                      # the gated Ablit weights instead (README "Ablit weights"); needs HF_TOKEN below
+# HF_TOKEN=hf_...              # a Hugging Face read token whose account agreed to the Ablit model's terms

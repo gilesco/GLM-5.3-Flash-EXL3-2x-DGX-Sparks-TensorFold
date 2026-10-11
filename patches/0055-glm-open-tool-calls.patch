@@ -91,10 +91,10 @@ index 1ad8ca7..55ccf2f 100644
          """Whether the end parser reads a block beginning ``name`` as a GLM call to an offered tool."""
  
 diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
-index 04cb9f0..d65df9b 100644
+index 0626467..d3d48c4 100644
 --- tensorfold/cuda/server.py
 +++ tensorfold/cuda/server.py
-@@ -27,7 +27,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+@@ -28,7 +28,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
  from tensorfold.cuda import health
  from tensorfold.cuda.chat_template import ChatTemplate
  from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
@@ -103,7 +103,7 @@ index 04cb9f0..d65df9b 100644
  from tensorfold.cuda.turns import Turns, Yield
  from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
  from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
-@@ -426,6 +426,7 @@ class App:
+@@ -429,6 +429,7 @@ class App:
          # end parser
          xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
          answer_raw = [""]
@@ -111,7 +111,7 @@ index 04cb9f0..d65df9b 100644
          # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
          think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
                   else None)
-@@ -446,6 +447,7 @@ class App:
+@@ -449,6 +450,7 @@ class App:
              raw = stream.final() if finished else stream.text
              # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
              raw = stops.visible(raw, partial=not finished) if stops.strings else raw
@@ -119,7 +119,7 @@ index 04cb9f0..d65df9b 100644
              reasoning, answer = split(raw, finished)
              answer_raw[0] = answer
              if tools:
-@@ -576,12 +578,18 @@ class App:
+@@ -580,12 +582,18 @@ class App:
          if stopped["client"]:                                        # as the Mac server: nothing more is written
              raise RequestCancelled("the client left during the reply")
          stats = {**(stats or {}), "token_sha": token_sha(out)}
@@ -139,7 +139,7 @@ index 04cb9f0..d65df9b 100644
          raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
          content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
          content = policy.content(content) if tools else content
-@@ -592,10 +600,12 @@ class App:
+@@ -596,10 +604,12 @@ class App:
              call_deltas = calls_stream.feed(call_text(raw))
              streamed = calls_stream.sent
              calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None

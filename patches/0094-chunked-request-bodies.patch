@@ -1,0 +1,46 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 6f4c267..b4b137f 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -8,11 +8,7 @@ import uuid
+ from typing import TYPE_CHECKING, Any
+ 
+ from tensorfold.cuda import health
+-<<<<<<< ours
+ from tensorfold.server import anthropic, metrics, responses, token_routes
+-=======
+-from tensorfold.server import anthropic, metrics, responses
+->>>>>>> theirs
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.decisions import DecisionError
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+@@ -113,12 +109,9 @@ def make_handler(app: App):
+             responses.delete(self, app, responses.route(self.path))
+ 
+         def do_POST(self):
+-<<<<<<< ours
+             path = self.path.split("?", 1)[0].rstrip("/")
+             if path.endswith("/decisions"):
+                 return self._post_decisions()
+-=======
+->>>>>>> theirs
+             if anthropic.route(self.path):
+                 return anthropic.post(self, app)
+             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
+@@ -262,7 +255,6 @@ def make_handler(app: App):
+                            "usage": usage, "tensorfold": result["stats"]}
+             if result.get("stop_sequence") is not None:
+                 payload["stop_sequence"] = result["stop_sequence"]
+-<<<<<<< ours
+             self._json(200, payload)
+ 
+         def _post_decisions(self) -> None:
+@@ -289,8 +281,6 @@ def make_handler(app: App):
+                     return self._json(500, {"error": {"message": _error_message(exc)}})
+                 except OSError:
+                     return
+-=======
+->>>>>>> theirs
+             self._json(200, payload)
+ 
+     from tensorfold.server.auth_http import handler
