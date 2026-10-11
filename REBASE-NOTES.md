@@ -10,8 +10,8 @@ To try it:
 
     ./start.sh          # from this folder; config.sh defaults TF_VERSION to the pinned tip commit
 
-Revert to production: check out main (its patches target v0.6.0), or run start.sh from the production
-folder. Nothing here touches the production checkout, image, kernel cache (this branch uses
+Revert to production: use [MiaAI-Lab's repository](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+(its `main` targets v0.6.0), or run start.sh from a production checkout of that repo. Nothing here touches the production checkout, image, kernel cache (this branch uses
 ~/.cache/tensorfold-glm53-v064) or container until start.sh runs.
 
 ## Measured on this tree (2026-10-11)
@@ -55,17 +55,17 @@ for this patches hash); kernels recompile at first start.
 
 ---
 
-# TensorFold v0.6.4 rebase (branch tensorfold-v0.6.4)
+# TensorFold v0.6.4 rebase (branch tensorfold-v0.6.4) — superseded by the rebase at the top of this file; kept as the record of that rebase
 
 The 70 patches of recipe v1.5 were diffs against TensorFold **v0.6.0**'s site-packages. This
 branch rebases them onto **v0.6.4** (676de9f, 2026-10-03; 170 commits between the tags). To try it:
 
     ./start.sh          # from this folder; config.sh here defaults TF_VERSION to v0.6.4
 
-Revert to production: check out main (its patches target v0.6.0 and local.sh there has no
-TF_VERSION override), or just run start.sh from the production folder. Nothing here touches the
-production checkout, image, kernel cache (this branch uses ~/.cache/tensorfold-glm53-v064) or
-container until start.sh runs.
+Revert to production: use [MiaAI-Lab's repository](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+(its `main` targets v0.6.0 and local.sh there has no TF_VERSION override), or just run start.sh from a
+production checkout of that repo. Nothing here touches a
+production checkout, image, kernel cache or container until start.sh runs.
 
 ## What changed
 
