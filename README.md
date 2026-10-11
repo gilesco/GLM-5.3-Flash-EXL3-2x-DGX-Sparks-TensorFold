@@ -111,8 +111,9 @@ part of this recipe. See the [qualification note](docs/MCDMA_MAC_STUDIO_QUALIFIC
 On the head:
 
 ```bash
-git clone https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold.git
+git clone https://github.com/gilesco/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold.git
 cd GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+git checkout main
 cp scripts/local.sh.example scripts/local.sh     # set WORKER=user@192.0.2.2 in it (and FABRIC_PEER, see below)
 ./start.sh
 ```
