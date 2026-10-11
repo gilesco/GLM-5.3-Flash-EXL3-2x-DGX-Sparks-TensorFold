@@ -1,3 +1,50 @@
+# Rebase to TensorFold's python-0.6 tip, plus mia/main's v1.6–v1.10 patches (branch tensorfold-v0.6.4)
+
+2026-10-11: the branch (69 patches on **v0.6.4**) was rebased onto the `python-0.6` branch's tip
+(**ed78d6fc**, 2026-10-07: version 0.6.6 plus twelve unreleased commits), and the 37 patches mia/main grew
+since the fork (**0071–0108**, its recipe v1.6–v1.10) folded in. **106 patches** now, one of them empty:
+0058 stays dropped (TensorFold's own since v0.6.2, #218), and 0023's hunks are all upstreamed
+(v0.6.1–v0.6.3), so it is a no-op here — kept for the numbering, `patch` skips it.
+
+To try it:
+
+    ./start.sh          # from this folder; config.sh defaults TF_VERSION to the pinned tip commit
+
+Revert to production: check out main (its patches target v0.6.0), or run start.sh from the production
+folder. Nothing here touches the production checkout, image, kernel cache (this branch uses
+~/.cache/tensorfold-glm53-v064) or container until start.sh runs.
+
+## What changed since the v0.6.4 rebase
+
+- **Upstream's TP-4 (f39624dc)** met recipe 0066's TP-N: the recipe's machinery wins for the GLM files
+  (split.py's `rank_cut`/`layout_for`/cut-aware `RankReader`, weights.py's `load(world)`, the engine's
+  `cut`/`share` estimate closures); upstream's newer all-gather helpers (`self.world` refactors) stay.
+  `--tp` now accepts 1, 2, 3, 4 (recipe's superset), and `tensorfold_qmm_v6` bumps to **v7** (0103's
+  no-cluster decode path rides on the rebased v6, not mia's v5 chain).
+- **Upstream's Anthropic work is upstream's**: the tip carries its own `anthropic_translate.py` and
+  `request_body.py` (byte-identical to mia's 0084 backport for the latter; the former is upstream's
+  richer tool-result-media version). 0084's wiring (routes, admission responses) merges on top.
+- **mia's new features on the rebased tree**: capacity admission (0081–0083), the spill tier (0088,
+  integrated into this branch's multi-stream worker loop: shutdown flush, `cached < 0` disk resume,
+  `_spill_wait` before a run), the loop guard (0091), chunked bodies (0094, cosmetic hunks only —
+  the tip's `read_body` already does chunked), the effort tail (0096, keeping the rebased 0060's
+  `clear_thinking` kwarg), tokenize without the GIL (0099, `_flag` deduplicated),
+  0100–0108's CUDA kernels (0103's qmm chain bumped v5→v7).
+
+## Method
+
+Same as the rebase below: two reference trees (v0.6.4 + this branch's 69; v0.6.0 + mia's 107), one
+commit per patch onto the tip, per-file three-way merges, conflicts resolved by hand. The final patch
+set was regenerated from the merge history; the regenerated series applies 106/106 cleanly on a fresh
+`ed78d6fc` tree, and the result is byte-identical to the merge tree. `py_compile` passes for every .py
+in the tree. The .cu/.cpp hunks merged by diff3 or by hand but are only truly checked by a build
+(start.sh does it; see the caveats of the v0.6.4 rebase below — they still apply).
+
+Not re-measured here (no GPU): everything on the Sparks. The image builds locally (no prebuilt exists
+for this patches hash); kernels recompile at first start.
+
+---
+
 # TensorFold v0.6.4 rebase (branch tensorfold-v0.6.4)
 
 The 70 patches of recipe v1.5 were diffs against TensorFold **v0.6.0**'s site-packages. This

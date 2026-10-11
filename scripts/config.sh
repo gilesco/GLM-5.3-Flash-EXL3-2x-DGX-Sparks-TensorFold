@@ -66,7 +66,8 @@ case "$MODEL_ID" in
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-TF_VERSION="${TF_VERSION:-v0.6.4}"
+TF_VERSION="${TF_VERSION:-ed78d6fc204d89d90b045bf033d6551e7714f3a1}"   # the python-0.6 branch's tip (2026-10-07;
+                                                                       # "0.6.6" plus twelve unreleased commits)
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
@@ -79,6 +80,8 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
 # The same image serves two and three Sparks.
+# The published image of mia/main's v0.6.0 patches, pinned (not ours: this branch's patches hash differs, so
+# prepare.sh builds locally the first time — the same for every rebased series before it).
 IMAGE_TAG="${IMAGE_TAG:-v0.6.0-e66c657a433d}"
 IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:14b5072e8e9918f1080153f57321415a387bc7d78cf9c9b44a7aeae2d4399ccf}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
