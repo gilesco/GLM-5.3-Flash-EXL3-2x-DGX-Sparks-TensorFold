@@ -1,4 +1,4 @@
-# Rebase to TensorFold's python-0.6 tip, plus mia/main's v1.6–v1.10 patches (branch tensorfold-v0.6.4)
+# Rebase to TensorFold's python-0.6 tip, plus mia/main's v1.6–v1.10 patches (branch main)
 
 2026-10-11: the branch (69 patches on **v0.6.4**) was rebased onto the `python-0.6` branch's tip
 (**ed78d6fc**, 2026-10-07: version 0.6.6 plus twelve unreleased commits), and the 37 patches mia/main grew
