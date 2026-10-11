@@ -37,7 +37,8 @@ vision, tool calling, `/tokenize` and `/metrics`.
 
 Two DGX Sparks at the default configuration (4 streams, 1,048,576-token window, FP8 KV cache, 4-bit dense weights,
 DFlash2 plus copy drafts, vision on). Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) through the
-OpenAI API from another machine on the network, on TensorFold v0.6.4 (2026-10-03). The GPU clocks were capped
+OpenAI API from another machine on the network, on TensorFold's `python-0.6` tip (`ed78d6fc`, 2026-10-11) with the
+full patch set below. One boot, one run per figure (no averaging). The GPU clocks were capped
 at 2,200 MHz (the head sets `nvidia-smi -lgc 200,2200` at boot via `nvidia-power-limit.service`), so the GPU was
 intentionally rate-limited.
 
@@ -45,21 +46,26 @@ intentionally rate-limited.
 
 | Concurrent requests | Prose | Prose, per request | TTFT | Structured | Structured, per request | TTFT | Code | Code, per request | TTFT |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 61.2 tok/s | 61.2 tok/s | 174 ms | 110.5 tok/s | 110.5 tok/s | 156 ms | 84.9 tok/s | 84.9 tok/s | 238 ms |
-| 2 | 78.7 tok/s | 39.4 tok/s | 310 ms | 174.5 tok/s | 87.2 tok/s | 250 ms | 115.3 tok/s | 57.6 tok/s | 323 ms |
-| 4 | 107.8 tok/s | 27.0 tok/s | 312 ms | 149.7 tok/s | 37.4 tok/s | 432 ms | 134.9 tok/s | 33.7 tok/s | 460 ms |
+| 1 | 61.8 tok/s | 61.8 tok/s | 162 ms | 110.5 tok/s | 110.5 tok/s | 143 ms | 85.2 tok/s | 85.2 tok/s | 213 ms |
+| 2 | 75.2 tok/s | 39.1 tok/s | 524 ms | 159.0 tok/s | 81.4 tok/s | 277 ms | 115.1 tok/s | 58.6 tok/s | 284 ms |
+| 4 | 105.5 tok/s | 27.7 tok/s | 372 ms | 155.7 tok/s | 54.4 tok/s | 547 ms | 134.5 tok/s | 36.4 tok/s | 515 ms |
 
 **Prefill**
 
 | Prompt | Prefill | Time to first token |
 | ---: | ---: | ---: |
-| 8,218 tokens | 1,967.1 tok/s | 4.18 s |
-| 16,405 tokens | 1,965.5 tok/s | 8.35 s |
-| 32,792 tokens | 2,010.6 tok/s | 16.31 s |
-| 65,559 tokens | 1,962.0 tok/s | 33.42 s |
-| 131,096 tokens | 1,842.5 tok/s | 71.15 s |
+| 8,192 tokens | 2,054.7 tok/s | 4.20 s |
+| 16,384 tokens | 2,031.6 tok/s | 8.28 s |
+| 32,768 tokens | 2,018.0 tok/s | 16.45 s |
+| 65,536 tokens | 1,935.6 tok/s | 34.07 s |
+| 131,072 tokens | 1,900.2 tok/s | 69.19 s |
 
-Prompt-reuse, 8-requests-at-once and quality figures (GSM8K, HumanEval, MBPP+) are not re-measured on v0.6.4 yet;
+**Tool calling** ([tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) `--perf --hardmode --seed 42`,
+the full 97-scenario suite plus Hard Mode, against this server): **91/100** (177 of 194 points; the partials are all
+Hard-Mode milestone scenarios). llama-benchy on the same run: 1,829 pp tok/s / 63.0 tg tok/s at one stream
+(TTFT 1.29 s), 78.2 tg tok/s at 2 and 67.1 at 4 concurrent.
+
+Prompt-reuse, 8-requests-at-once and quality figures (GSM8K, HumanEval, MBPP+) are not re-measured on this tree yet;
 the quality scores of the earlier, v0.6.0-based recipe are on the
 [model card](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold).
 
@@ -210,9 +216,9 @@ the progress lines, the window retry or the smoke test; when either rank ends, i
 **`scripts/prepare.sh`** does the one-time setup, and is safe to re-run (each step skips work already done):
 
 1. Preflight on both Sparks: Docker, the GPU, `rsync`, key-based ssh, the RoCE link, disk space.
-2. The image `tensorfold-glm53:v0.6.4` on the head: TensorFold v0.6.4 with every `patches/*.patch` applied, plus PyAV
+2. The image `tensorfold-glm53:<TF_VERSION>` on the head: TensorFold (the pinned python-0.6 tip) with every `patches/*.patch` applied, plus PyAV
    (video decoding) and xgrammar (structured outputs), on NVIDIA's `nvcr.io/nvidia/pytorch:26.07-py3`. It first
-   pulls the published image `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.4-<image hash>`,
+   pulls the published image `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:<TF_VERSION>-<image hash> (no prebuilt exists for this branch; it builds locally)`,
    by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`) while the patches still hash to that release's
    (the hash covers the patches and those pip packages); after you change `patches/`, it pulls that hash's tag if
    one is published, else (or with `PULL=0`) it builds.
@@ -228,7 +234,7 @@ PREPARE=1 ./start.sh restart   # force prepare.sh, then restart; PREPARE=0 skips
 ```
 
 After changing `patches/`, `scripts/publish-image.sh` pushes the new image to GitHub Container Registry (`latest` and
-`v0.6.4-<image hash>`, the tag `prepare.sh` looks for).
+`<TF_VERSION>-<image hash>` — the tag `prepare.sh` looks for; none is published for this branch yet, so it builds locally).
 
 ## KV pool and memory
 
@@ -372,7 +378,7 @@ published checkpoint, which stays in the cache.
 
 `./start-tp3.sh` runs the same recipe as tensor parallel over three Sparks (`TP=3` with `./start.sh`'s options;
 `./stop.sh` stops every configured worker). **The engine for `--tp N` comes from this repo's patches 0066-0068**
-(TensorFold v0.6.4 itself serves two ranks only), in the same published image as two Sparks (`prepare.sh` pulls it on the head and copies it to every worker). **Three Sparks** were tested on v1.3.2's patches (exact against two Sparks, drafted == serial, images and
+(TensorFold itself serves two ranks only), in the same published image as two Sparks (`prepare.sh` pulls it on the head and copies it to every worker). **Three Sparks** were tested on v1.3.2's patches (exact against two Sparks, drafted == serial, images and
 tool calls, concurrent requests). On top of v1.4 (2026-10-03, `KV_POOL_GIB=27`, NCCL, two boots: sliced fill on and
 off): concurrent requests equal one at a time (22/22 each boot), drafted == serial (6/6), long-prompt replies and every
 streamed reply the same with the sliced fill on and off, the 195k needle right, a prompt cancelled
@@ -495,7 +501,7 @@ Speed settings' measured effects: [What the patches change](#what-the-patches-ch
 changes nothing until the pin does. Set one empty to take the Hub's `main` when first downloaded.
 
 Less common settings are described in `scripts/config.sh` and `scripts/nodes.sh`: `MODEL_ID`, `DFLASH2_ID`,
-`TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for TensorFold v0.6.4; after changing any of these run
+`TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for the pinned python-0.6 tip;) after changing any of these run
 `scripts/prepare.sh --rebuild`), `IMAGE`, `CONTAINER_NAME`, `GHCR_IMAGE`, `HF_CACHE` (default `$HF_HOME` or
 `~/.cache/huggingface`), `KERNEL_CACHE`, `STATE_DIR`, `MIN_FREE_GB`, `IMAGE_FREE_GB`, `NCCL_RAILS` (`1`: one RoCE
 port even when the cabled port's two PCIe links, or a second port, are up; at two Sparks `start.sh` pings each second rail across the link before using it and drops one that does not answer, with a warning), `NCCL_CHANNELS` (4), `NCCL_DEBUG`, `RSYNC_OPTS`. `start.sh` also takes `HF_HUB_OFFLINE=0` (let the
@@ -559,7 +565,7 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
 
 ## What the patches change
 
-`scripts/prepare.sh` bakes every `patches/*.patch` into the image (diffs against TensorFold v0.6.4's site-packages,
+`scripts/prepare.sh` bakes every `patches/*.patch` into the image (diffs against TensorFold's site-packages at the pinned tip,
 applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the image when the patches change.
 
 | Area | Patches | Change | Effect |
@@ -684,7 +690,7 @@ NOTICE        third-party notices (TensorFold's MIT and Apache-2.0 notices, b12x
 ## License
 
 Apache License 2.0, see [`LICENSE`](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices that go with it: the
-files in `patches/` modify TensorFold v0.6.4, and the TensorFold code they change or quote as context stays under
+files in `patches/` modify TensorFold at the pinned tip, and the TensorFold code they change or quote as context stays under
 TensorFold's licenses (Apache 2.0 from v0.6.0, and the MIT notice of code written before it, both in `NOTICE`); parts
 of patches 0006 (b12x), 0036, 0046 and 0047 (glm53-tensorfold-spark) come from Apache-2.0 projects, credited there and
 in [`CREDITS.md`](CREDITS.md). The model

@@ -5,6 +5,11 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Rebased to TensorFold's `python-0.6` tip (`ed78d6fc`, "0.6.6" plus twelve unreleased commits) and folded in
+  mia/main's v1.6-v1.10 patches (`0071`-`0108`)** — 106 patches on the tip, 0058 stays dropped (upstream's own since
+  v0.6.2), 0023 is a no-op here (its hunks are upstreamed). This branch's measurements (sparkDash decode and
+  prefill, tool-eval-bench `--perf --hardmode --seed 42`: 91/100, 177/194 points) are in the README's Performance
+  section. Details in REBASE-NOTES.md.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

@@ -14,6 +14,16 @@ Revert to production: check out main (its patches target v0.6.0), or run start.s
 folder. Nothing here touches the production checkout, image, kernel cache (this branch uses
 ~/.cache/tensorfold-glm53-v064) or container until start.sh runs.
 
+## Measured on this tree (2026-10-11)
+
+Launched on the two-Spark cluster after the rebase (one boot, one run per figure): sparkDash decode
+61.8 / 75.2 / 105.5 tok/s (prose), 110.5 / 159.0 / 155.7 (structured), 85.2 / 115.1 / 134.5 (code) at
+1 / 2 / 4 concurrent; prefill 2,055 / 2,032 / 2,018 / 1,936 / 1,900 tok/s at 8k / 16k / 32k / 65k / 131k
+prompts — at or above the v0.6.4 table below everywhere but c2's prose and structured (single-run
+spread). tool-eval-bench `--perf --hardmode --seed 42`: 91/100 (177/194 points), all partials in
+Hard-Mode milestone scenarios; llama-benchy on the same run 1,829 pp tok/s / 63.0 tg tok/s single
+(TTFT 1.29 s), 78.2 / 67.1 tg tok/s at 2 / 4 concurrent.
+
 ## What changed since the v0.6.4 rebase
 
 - **Upstream's TP-4 (f39624dc)** met recipe 0066's TP-N: the recipe's machinery wins for the GLM files
