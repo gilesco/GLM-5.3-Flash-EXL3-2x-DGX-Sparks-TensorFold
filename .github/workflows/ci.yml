@@ -1,7 +1,10 @@
 name: ci
-# CPU-only checks: patches apply to the pinned TensorFold source, the image pin matches the
-# patch set, and the self-contained tools tests pass against a patched source tree.
-# No GPU, no docker, no model downloads (only the checkpoint's chat_template.jinja, a few KB).
+# CPU-only checks: the patch series applies to the pinned TensorFold source (scripts/config.sh's
+# TF_VERSION, this fork's python-0.6 tip pin — NOT v0.6.0), the patched tree compiles, and the
+# self-contained tools tests pass against it.
+# No GPU, no docker, no model downloads (only the checkpoint's chat_template.jinja and tokenizer, a few MB).
+# There is no image-pin check: this fork publishes no images — prepare.sh builds locally
+# (scripts/config.sh's IMAGE_TAG is mia's production pin, kept for reference only).
 on:
   pull_request:
   push:
@@ -9,35 +12,44 @@ on:
 
 jobs:
   patches-and-pin:
+    name: patches apply, tree compiles, tools tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Apply patches to the pinned TensorFold source
+      - name: Apply the series to the pinned TensorFold source
         run: |
-          git clone --depth 1 --branch v0.6.0 https://github.com/ashhart/TensorFold.git /tmp/tf
+          TF_VERSION="$(sed -n 's/^TF_VERSION="\${TF_VERSION:-\([^}]*\)}".*/\1/p' scripts/config.sh | head -1)"
+          echo "pinned TF_VERSION: $TF_VERSION"
+          git clone https://github.com/ashhart/TensorFold.git /tmp/tf
+          git -C /tmp/tf checkout --quiet "$TF_VERSION"
           cd /tmp/tf/src
+          status=0
           for p in "$OLDPWD"/patches/*.patch; do
             echo "applying $(basename "$p")"
-            patch -p0 --forward < "$p" > /dev/null || { echo "::error::$(basename "$p") does not apply to TensorFold v0.6.0"; exit 1; }
+            patch -p0 --batch --forward --no-backup-if-mismatch --silent < "$p" > /dev/null \
+              || { echo "::error::$(basename "$p") does not apply to TensorFold at $TF_VERSION"; status=1; }
           done
+          find . -name '*.rej' -o -name '*.orig' | head -5
+          exit $status
+      - name: The patched tree compiles
+        run: |
+          find /tmp/tf/src -name '*.py' -print0 | xargs -0 python3 -m py_compile
+          echo "every .py in the patched tree compiles"
       - name: Self-contained tools tests (against the patched tree)
         run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet jinja2
           MD="$RUNNER_TEMP/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/rev"
           mkdir -p "$MD"
           B=https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/resolve/main
           for f in chat_template.jinja tokenizer_config.json tokenizer.json; do
             curl -fsSL -o "$MD/$f" "$B/$f"
           done
-          python tools/test_chunked_bodies.py --source-root /tmp/tf/src
-          python tools/test_effort_tail.py  --source-root /tmp/tf/src --model-dir "$MD"
-      - name: Image pin matches the patch set
+          /tmp/venv/bin/python tools/test_chunked_bodies.py --source-root /tmp/tf/src
+          /tmp/venv/bin/python tools/test_effort_tail.py  --source-root /tmp/tf/src --model-dir "$MD"
+      - name: Report the patch-set hash
         run: |
           # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]
           E="$(sed -n 's/^IMAGE_EXTRAS="\(.*\)"/\1/p' scripts/config.sh)"
           H="$( (cat patches/*.patch; echo "$E") | sha256sum | cut -c1-12)"
-          T="$(sed -n 's/^IMAGE_TAG="\${IMAGE_TAG:-\(v[^"]*\)}"/\1/p' scripts/config.sh)"
-          echo "patch-set hash: $H   pinned IMAGE_TAG: $T"
-          if [ "$T" != "v0.6.0-$H" ]; then
-            echo "::error::IMAGE_TAG ($T) does not match the current patch set (v0.6.0-$H). Publish an image for this patch set or bump the pin."
-            exit 1
-          fi
+          echo "patch-set hash: $H (no published image for this fork; prepare.sh builds locally)"
