@@ -1,0 +1,61 @@
+# GET and DELETE requests have their bodies read. The CUDA handler's do_GET and do_DELETE never read a body, so a GET
+# or DELETE carrying one (scanners send GETs with a body) left those bytes on the keep-alive connection, and the
+# stdlib parsed them as the start of the next request on it: a "Bad request syntax" 400, in HTML with no JSON, for
+# whatever came next. Behind a pooling proxy (nginx upstream keepalive) that next request is often another client's.
+# Both now call _discard_body (patch 0059's helper, read_body underneath: Content-Length or chunked, a refusal closes
+# the connection) before answering, as do_POST's refusals already do. A request without a body reads nothing. A GET or
+# DELETE has no use for a body, so the read is bounded at 64 KiB (not the 32 MiB a POST may carry): a larger one is
+# refused unread and the connection closed, so a stream of big GET bodies cannot make the server buffer them.
+# tools/test_get_bodies.py.
+
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index c1c1454..98b6fd9 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -16,7 +16,7 @@ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.decisions import DecisionError
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+ from tensorfold.server.http import Server, wants_usage_chunk
+-from tensorfold.server.request_body import read_body
++from tensorfold.server.request_body import LIMIT, read_body
+ from tensorfold.server.stacks import Rearming
+ 
+ if TYPE_CHECKING:
+@@ -24,6 +24,7 @@ if TYPE_CHECKING:
+ 
+ 
+ _TOKENIZER_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
++_BODY_DISCARD_LIMIT = 64 * 1024              # a GET or DELETE has no use for a body: one this large closes the connection
+ 
+ 
+ def _keepalive_seconds() -> float:
+@@ -136,11 +137,11 @@ def make_handler(app: App):
+             except (BrokenPipeError, ConnectionResetError):          # the client has gone
+                 self.close_connection = True
+ 
+-        def _discard_body(self) -> None:
++        def _discard_body(self, limit: int = LIMIT) -> None:
+             """Read a refused request's body, so it cannot reach the next request on this connection."""
+ 
+             try:
+-                read_body(self)
++                read_body(self, limit=limit)     # Content-Length or chunked; a refusal has closed the connection
+             except RequestError:
+                 pass  # the reader closes the connection when framing cannot be drained
+ 
+@@ -156,6 +157,7 @@ def make_handler(app: App):
+             self.close_connection = True
+ 
+         def do_GET(self):
++            self._discard_body(_BODY_DISCARD_LIMIT)
+             route = self.path.split("?", 1)[0].rstrip("/")
+             if route in ("/metrics", "/v1/metrics"):
+                 return metrics.send(self, app)
+@@ -171,6 +173,7 @@ def make_handler(app: App):
+                 self._json(404, {"error": "not found"})
+ 
+         def do_DELETE(self):
++            self._discard_body(_BODY_DISCARD_LIMIT)
+             responses.delete(self, app, responses.route(self.path))
+ 
+         def do_POST(self):

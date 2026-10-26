@@ -1,3 +1,43 @@
+# Fold in mia/main's v1.11 patches (0109-0122, 0128, 0129 + the 0088 fix) (branch main)
+
+2026-10-26: 16 new patches and the 0088 NoRoom fix folded onto the same python-0.6 tip (ed78d6fc). **122 patches**
+now: 0109 is a no-op here (its upstream 69d0ca9 hunk is already in the tip, like 0023's; kept for the numbering,
+`patch` skips the empty file), 0058 stays dropped, 0023 stays empty. mia's numbering has no 0123-0127.
+
+Method: two reference trees again (v0.6.0 + mia's 123; the tip + our 106), a commit-per-patch history, mia's
+patches three-way merged in order (base = mia's tree before the patch, theirs = after, ours = our tree), the
+regenerated series verified: 122/122 apply clean on a fresh tip (`patch --fuzz` defaults, `--no-backup-if-mismatch`,
+no .rej), the result byte-identical to the fold tree, every .py compiles.
+
+Conflicts, all small (nine regions in five files):
+
+- `cuda/http.py` (0113): the import line unions ours (`wants_usage_chunk`, from 0095's fold) with mia's `LIMIT`;
+  `_discard_body(self, limit=LIMIT)`'s threading took mia's side.
+- `cuda/server.py` (0115, 0117): ours' `split_thinking(text, finished=True)` naming (the rebase's 0060) against
+  mia's `split(text, True)`; 0117's `mask()`/`unmask()` machinery wraps ours' `stops.visible(raw_text)` and runs
+  before the fork's extra `unanswered`/`print_done` diagnostics.
+- `cuda/capacity.py` (0122): ours' `host_stream_bytes()` staging check and mia's one-reading `memory` threading
+  (`_READ`/`counting`/`parked_bytes`) both kept; `available_bytes`/`page_room` take the reading on a unified GPU and
+  keep ours' unified/cuda-limit body otherwise.
+- `families/glm5_next/cuda/engine.py` (0129): only the shard gate; ours' `self.mtp_on` line sits earlier in the
+  constructor (the rebase reordered it), so mia's copy of it was not duplicated.
+- `families/glm5_next/cuda/forward.py` (0129): the import line unions ours' `exl3_generic` with mia's `shard`.
+
+0088's fix (mia's liveloop + nanashi66's held-request mark, PR #210) folded into our integrated 0088 cleanly;
+the regenerated `0088-glm-spill-tier.patch` carries it.
+
+Not in the fold, on purpose: mia's image pins (`v0.6.0-789e8f3bdfa2`, `v0.6.0-7e5bd69b1266` — their patches hash,
+not ours; prepare.sh builds locally as before), their `.gitignore` deletion, their `local.sh.example` and issue
+template pin wording. Taken: the 20 tools (both modified ones matched our copies' base), the config.sh knobs
+(`SSE_KEEPALIVE_S`, the picture budget, spill quota/turns/release, `PREFIX_WAIT`), `nodes.sh`'s `_avail_gb`,
+prepare.sh's CDI warning, start.sh's memory check, NOTICE's credits, the README/CHANGELOG/CREDITS entries.
+
+Not re-measured here (no GPU on this box): everything on the Sparks. No .cu/.cpp hunks in the new set, so the
+image rebuilds but the kernels do not recompile. The patches hash changes; prepare.sh pulls nothing from ghcr and
+builds locally.
+
+---
+
 # Rebase to TensorFold's python-0.6 tip, plus mia/main's v1.6–v1.10 patches (branch main)
 
 2026-10-11: the branch (69 patches on **v0.6.4**) was rebased onto the `python-0.6` branch's tip

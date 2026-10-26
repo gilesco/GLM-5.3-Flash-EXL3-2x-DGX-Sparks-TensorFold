@@ -1,3 +1,5 @@
+# Folded (2026-10-26): mia/main's NoRoom liveloop fix — a staged stream that read nothing for its stored
+# prompt (no room yet) is looked for again once room may exist; staged.discard on the error paths too.
 diff --git tensorfold/cli.py tensorfold/cli.py
 index 0c3f6f4..52435db 100644
 --- tensorfold/cli.py
@@ -1725,7 +1727,7 @@ index 90692c3..b4c7cd5 100644
                        constraint, feed, shared)
              if hasattr(self.comm, "check"):
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index af9769e..ce427a1 100644
+index af9769e..4f1b371 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -38,6 +38,7 @@ import hashlib
@@ -2418,7 +2420,7 @@ index af9769e..ce427a1 100644
              else:
                  try:
                      left = until - time.monotonic() if until is not None else 0.0
-@@ -1895,9 +2405,24 @@ class GlmScheduler(Scheduler):
+@@ -1895,27 +2405,54 @@ class GlmScheduler(Scheduler):
              if self._cancel_item(item):
                  continue
              stream, box = item
@@ -2439,11 +2441,20 @@ index af9769e..ce427a1 100644
 +                if read is not None:
 +                    self.loading.append((read, item))
 +                    continue
-+            self.staged.discard(id(stream))
++                self.staged.discard(id(stream))      # (nothing read, e.g. no room for it yet: looked for again if it waits)
              self.boxes[id(stream)] = box
              try:
                  self.decoder.admit(stream)
-@@ -1912,10 +2437,20 @@ class GlmScheduler(Scheduler):
++                self.staged.discard(id(stream))
+             except NoRoom:
+                 self.boxes.pop(id(stream))
+                 self.held = item
+                 break
+             except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++                self.staged.discard(id(stream))
+                 self.boxes.pop(id(stream)).put(("error", exc))
+                 continue
+             if stream.done:
                  done.append(stream)
          return done
  
@@ -2465,7 +2476,7 @@ index af9769e..ce427a1 100644
              return
          live = list(self.decoder.streams.values())
          stream = next((s for s in reversed(live) if s.background and not s.done and s.constraint is None
-@@ -1956,7 +2491,10 @@ class GlmScheduler(Scheduler):
+@@ -1956,7 +2493,10 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()
