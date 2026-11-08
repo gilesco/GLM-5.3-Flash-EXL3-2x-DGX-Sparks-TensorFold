@@ -1,5 +1,15 @@
 <h1 align="center">GLM-5.3-Flash EXL3 on DGX Sparks with TensorFold</h1>
 
+> [!WARNING]
+> **This recipe is retired.** The production deployment moved to the **native CUDA (Zig) engine** line:
+> **[gilesco/GLM-5.3-Flash-EXL3-2x-GB10-TensorFold-ZIG](https://github.com/gilesco/GLM-5.3-Flash-EXL3-2x-GB10-TensorFold-ZIG)**.
+> That repo now owns the full lifecycle — the promoted native stack serves opencode on port 8000, testing windows
+> run on port 8001 through the same autonomous flow — and **all ongoing performance and quality work happens
+> there**, measured native-vs-native (current production against current testing). This repository remains only
+> as the archived record of the Python-based recipe below; it is no longer deployed.
+
+
+
 > [!NOTE]
 > This repository is a fork of [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold).
 > **All commits made since the fork were generated with AI assistance.**
